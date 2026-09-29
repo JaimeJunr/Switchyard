@@ -1,0 +1,56 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Switchyard routes served by the Claude Code, Codex, and Grok CLIs through the local bridge.
+#
+# Start the bridge first, then Switchyard:
+#   cargo run --release --manifest-path examples/cli_bridge/Cargo.toml
+#   switchyard-server --config examples/cli_bridge/routes.toml --port 4000
+
+schema_version = 1
+
+# One client reaches every CLI. The target id picks the CLI and, after the slash, the model.
+[llm_clients.cli_bridge]
+format = "openai_chat"
+base_url = "http://127.0.0.1:4100/v1"
+# A failed CLI call is rarely temporary. A common cause is a CLI that is not logged in.
+max_retries = 0
+
+[targets.claude_opus]
+id = "claude/opus"
+llm_client = "cli_bridge"
+
+[targets.claude_haiku]
+id = "claude/haiku"
+llm_client = "cli_bridge"
+
+[targets.codex]
+id = "codex"
+llm_client = "cli_bridge"
+
+[targets.grok]
+id = "grok"
+llm_client = "cli_bridge"
+
+# Auto: starts on the efficient target and moves to the capable target when the agent's
+# tool results show trouble. No judge call.
+[routes.auto]
+id = "switchyard"
+type = "auto"
+capable_target = "claude_opus"
+efficient_target = "codex"
+
+# Task: a judge model decides whether the efficient target can handle the task.
+[routes.task]
+id = "switchyard-task"
+type = "llm_classifier"
+mode = "capability"
+classifier_target = "claude_haiku"
+strong_target = "claude_opus"
+weak_target = "grok"
+base_threshold = 0.5
+# Each judge call starts a CLI, so judge once per user message instead of once per tool step.
+classify_trigger = "user_turn"
+message_hash_fallback = true
+# The CLIs have no JSON Schema mode. Switchyard puts the schema in the prompt instead.
+response_format_type = "json_object"

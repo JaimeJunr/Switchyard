@@ -39,6 +39,9 @@ These are integration paths you configure in your own deployment. They are not a
 Agent-specific guides are available for [pi](docs/integrations/pi.md) and
 [Oh My Pi](docs/integrations/oh_my_pi.md).
 
+To use the Claude Code, Codex, or Grok CLIs as models, see the
+[CLI bridge](examples/cli_bridge/README.md).
+
 ### Embed the library in your harness
 
 [Embed the library in your harness](docs/getting_started.md#library-path) to run routing inside your Rust application. For Python, see the [embedding example](examples/libsy.py).

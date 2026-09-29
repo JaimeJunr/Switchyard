@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "switchyard-cli-bridge"
+version = "0.3.0"
+description = "Local OpenAI Chat Completions endpoint served by the Claude Code, Codex, and Grok CLIs"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.96.1"
+publish = false
+
+# This crate is its own workspace. It is not a member of the repository workspace, so the root
+# Cargo.toml and Cargo.lock do not change when it does.
+[workspace]
+
+[dependencies]
+axum = "0.8"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tempfile = "3"
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
