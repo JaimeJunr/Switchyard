@@ -222,8 +222,12 @@ impl SubscriptionLogin {
             .map_err(|error| self.error(format!("token refresh failed: {error}")))?;
         let status = response.status();
         if !status.is_success() {
+            let body = response.json::<Value>().await.unwrap_or_default();
+            let reason = oauth_error_code(&body)
+                .map(|code| format!(" ({code})"))
+                .unwrap_or_default();
             return Err(self.error(format!(
-                "token refresh failed with HTTP {status}; log in again with the CLI"
+                "token refresh failed with HTTP {status}{reason}; log in again with the CLI"
             )));
         }
         response
@@ -335,6 +339,22 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::write(path, bytes)
+}
+
+// The provider's error code, such as `invalid_refresh_token`. OAuth servers put it
+// in `error` (RFC 6749) or `error.code`. Only short identifiers are kept, so an
+// echoed token can never reach the message.
+fn oauth_error_code(body: &Value) -> Option<&str> {
+    let error = body.get("error")?;
+    let code = error
+        .as_str()
+        .or_else(|| error.get("code").and_then(Value::as_str))?;
+    let is_identifier = !code.is_empty()
+        && code.len() <= 64
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+    is_identifier.then_some(code)
 }
 
 // The `exp` claim of a JWT, in milliseconds. The signature is not checked; the
@@ -573,7 +593,9 @@ mod tests {
     async fn failed_refresh_names_the_file_but_not_the_token() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(400).set_body_string("invalid_grant"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                "error": {"code": "invalid_refresh_token", "message": "Invalid refresh token."}
+            })))
             .mount(&server)
             .await;
 
@@ -589,8 +611,26 @@ mod tests {
         let Err(error) = error else {
             panic!("expected refresh failure");
         };
+        assert!(error.contains("(invalid_refresh_token)"), "{error}");
         assert!(error.contains("log in again"), "{error}");
         assert!(!error.contains("old-refresh"), "{error}");
+    }
+
+    #[test]
+    fn only_identifier_error_codes_are_reported() {
+        assert_eq!(
+            oauth_error_code(&json!({"error": "invalid_grant"})),
+            Some("invalid_grant")
+        );
+        assert_eq!(
+            oauth_error_code(&json!({"error": {"code": "refresh_token_expired"}})),
+            Some("refresh_token_expired")
+        );
+        assert_eq!(
+            oauth_error_code(&json!({"error": "bad token: sk-123"})),
+            None
+        );
+        assert_eq!(oauth_error_code(&json!({"message": "no code"})), None);
     }
 
     #[tokio::test]
