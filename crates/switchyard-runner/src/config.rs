@@ -14,8 +14,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use switchyard_llm_client::{
-    AuxiliaryOperation, Backend, ClientRouter, DEFAULT_MAX_RETRIES, HttpBackendConfig, ModelConfig,
-    TranslatingLlmClient,
+    AuxiliaryOperation, Backend, ClientRouter, Credentials, DEFAULT_MAX_RETRIES, HttpBackendConfig,
+    ModelConfig, TranslatingLlmClient,
 };
 use switchyard_protocol::{Category, ModelId, RoutedLlmClient, WireFormat};
 
@@ -291,9 +291,7 @@ impl DeploymentConfig {
             let (Backend::OpenAiChat(config)
             | Backend::OpenAiResponses(config)
             | Backend::Anthropic(config)) = backend;
-            if let Some(key) = config.api_key {
-                provider_api_keys.push(key);
-            }
+            provider_api_keys.extend(config.credentials.keys().iter().cloned());
         }
         for (target_name, target) in &self.targets {
             let client_config = self.llm_clients.get(&target.llm_client).ok_or_else(|| {
@@ -570,6 +568,9 @@ struct LlmClientConfig {
     format: ClientFormat,
     base_url: HttpBaseUrl,
     api_key_env: Option<String>,
+    /// API keys tried in order; a rate limit, quota, or auth failure moves to the next one.
+    #[serde(default)]
+    credentials: Vec<CredentialConfig>,
     #[serde(default)]
     forward_auth: bool,
     #[serde(default)]
@@ -578,6 +579,13 @@ struct LlmClientConfig {
     max_retries: u32,
     /// Deadline in milliseconds for all attempts and the complete response. Unset is unbounded.
     timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+enum CredentialConfig {
+    /// Name of an environment variable holding an API key.
+    Env(String),
 }
 
 #[derive(Debug, Deserialize)]
@@ -664,14 +672,28 @@ fn build_backend(
             "llm client {client_name} timeout_ms must be at least 1"
         )));
     }
+    if config.api_key_env.is_some() && !config.credentials.is_empty() {
+        return Err(RunnerError::configuration(format!(
+            "llm client {client_name} cannot set both api_key_env and credentials"
+        )));
+    }
     if config.forward_auth && config.api_key_env.is_some() {
         return Err(RunnerError::configuration(format!(
             "llm client {client_name} cannot set both forward_auth and api_key_env"
         )));
     }
-    let api_key = config
-        .api_key_env
-        .as_deref()
+    if config.forward_auth && !config.credentials.is_empty() {
+        return Err(RunnerError::configuration(format!(
+            "llm client {client_name} cannot set both forward_auth and credentials"
+        )));
+    }
+    let variables = config.api_key_env.iter().chain(
+        config
+            .credentials
+            .iter()
+            .map(|CredentialConfig::Env(variable)| variable),
+    );
+    let keys = variables
         .map(|variable| {
             if variable.trim().is_empty() {
                 return Err(RunnerError::configuration(format!(
@@ -690,10 +712,10 @@ fn build_backend(
             }
             Ok(api_key)
         })
-        .transpose()?;
+        .collect::<RunnerResult<Vec<_>>>()?;
     let http = HttpBackendConfig {
         base_url: config.base_url.as_str().to_string(),
-        api_key,
+        credentials: Credentials::new(keys),
         forward_auth: config.forward_auth,
         extra_headers: config.extra_headers.clone(),
         extra_body: extra_body.clone(),
@@ -1844,6 +1866,40 @@ confidence_threshold = 0.5
             std::env::remove_var(EMPTY_KEY_ENV);
         }
         assert!(message.contains("is empty"));
+    }
+
+    #[test]
+    fn credentials_list_loads_every_key() -> RunnerResult<()> {
+        const FIRST: &str = "SWITCHYARD_CONFIG_TEST_FIRST_KEY";
+        const SECOND: &str = "SWITCHYARD_CONFIG_TEST_SECOND_KEY";
+        unsafe {
+            // "unsafe" is for concurrent reads and writes, very rare
+            std::env::set_var(FIRST, "first-key");
+            std::env::set_var(SECOND, "second-key");
+        }
+        let configured = VALID_CONFIG.replacen(
+            "base_url = \"https://example.test/v1\"",
+            &format!(
+                "base_url = \"https://example.test/v1\"\ncredentials = [{{ env = \"{FIRST}\" }}, {{ env = \"{SECOND}\" }}]"
+            ),
+            1,
+        );
+        let runner = runner_from_toml(&configured);
+        let both = VALID_CONFIG.replacen(
+            "base_url = \"https://example.test/v1\"",
+            &format!(
+                "base_url = \"https://example.test/v1\"\napi_key_env = \"{FIRST}\"\ncredentials = [{{ env = \"{SECOND}\" }}]"
+            ),
+            1,
+        );
+        let both = error_message(&both);
+        unsafe {
+            std::env::remove_var(FIRST);
+            std::env::remove_var(SECOND);
+        }
+        assert_eq!(runner?.provider_api_keys(), ["first-key", "second-key"]);
+        assert!(both.contains("cannot set both api_key_env and credentials"));
+        Ok(())
     }
 
     #[test]

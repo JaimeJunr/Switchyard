@@ -409,7 +409,8 @@ impl TranslatingLlmClient {
         let builder = forward_metadata_headers(builder, metadata, backend);
         let builder = backend.apply_forwarded_auth(builder, metadata);
         let builder = apply_extra_headers(builder, backend);
-        let builder = backend.apply_auth(builder);
+        let credential = backend.current_credential();
+        let builder = backend.apply_auth_with(builder, credential);
 
         let response = match builder.send().await {
             Ok(response) => response,
@@ -419,6 +420,7 @@ impl TranslatingLlmClient {
                     error: convert_reqwest_error(error),
                     status: None,
                     retry_after: None,
+                    rotated: false,
                 });
             }
         };
@@ -434,6 +436,7 @@ impl TranslatingLlmClient {
                             error,
                             status: Some(status),
                             retry_after: None,
+                            rotated: false,
                         });
                     }
                 };
@@ -453,6 +456,7 @@ impl TranslatingLlmClient {
                         error: convert_reqwest_error(error),
                         status: Some(status),
                         retry_after: None,
+                        rotated: false,
                     });
                 }
             };
@@ -473,11 +477,15 @@ impl TranslatingLlmClient {
                     error: convert_reqwest_error(error),
                     status: Some(status),
                     retry_after,
+                    rotated: false,
                 });
             }
         };
         let body = redact_forwarded_headers(body, metadata, backend.is_forwarding_auth());
         metrics::record_upstream_attempt(Some(status.as_u16()));
+        // Rate limit, quota, and auth failures are tied to one key; another key may succeed.
+        let rotated = matches!(status.as_u16(), 401 | 402 | 403 | 429)
+            && credential.is_some_and(|used| backend.rotate_credential(used));
         let error =
             if status == reqwest::StatusCode::BAD_REQUEST && backend.is_context_overflow(&body) {
                 LlmClientError::ContextWindowExceeded {
@@ -491,6 +499,7 @@ impl TranslatingLlmClient {
             error,
             status: Some(status),
             retry_after,
+            rotated,
         })
     }
 
@@ -717,6 +726,8 @@ struct AttemptFailure {
     error: LlmClientError,
     status: Option<StatusCode>,
     retry_after: Option<Duration>,
+    // The failed key was replaced by another one, so the next attempt differs.
+    rotated: bool,
 }
 
 fn deadline_error(timeout: Duration) -> LlmClientError {
@@ -733,6 +744,9 @@ fn deadline_error(timeout: Duration) -> LlmClientError {
 
 impl AttemptFailure {
     fn is_retryable(&self) -> bool {
+        if self.rotated {
+            return true;
+        }
         match &self.error {
             LlmClientError::Transport { .. } | LlmClientError::Timeout { .. } => true,
             LlmClientError::UpstreamHttp { status, .. } => {
@@ -1295,12 +1309,12 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
-    use crate::backend::HttpBackendConfig;
+    use crate::backend::{Credentials, HttpBackendConfig};
 
     fn config(base_url: &str) -> HttpBackendConfig {
         HttpBackendConfig {
             base_url: base_url.to_string(),
-            api_key: Some("secret".to_string()),
+            credentials: Credentials::api_key("secret"),
             forward_auth: false,
             extra_headers: BTreeMap::new(),
             extra_body: BTreeMap::new(),
@@ -1381,7 +1395,7 @@ mod tests {
 
     fn forwarding_config(base_url: &str) -> HttpBackendConfig {
         HttpBackendConfig {
-            api_key: None,
+            credentials: Credentials::default(),
             forward_auth: true,
             ..config(base_url)
         }
@@ -2400,6 +2414,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_key_rotates_to_the_next_one()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::header("authorization", "Bearer first"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("quota exceeded"))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::header("authorization", "Bearer second"))
+            .respond_with(chat_success_response())
+            .mount(&server)
+            .await;
+
+        let config = HttpBackendConfig {
+            credentials: Credentials::new(vec!["first".to_string(), "second".to_string()]),
+            ..config_with_retries(&format!("{}/v1", server.uri()), 1)
+        };
+        let client = TranslatingLlmClient::new(&[ModelConfig::new(
+            "gpt",
+            Backend::OpenAiChat(config),
+            None,
+        )])?;
+        for _ in 0..2 {
+            let response = client
+                .call_rewrite_model(request_for(Some("gpt"), false), None)
+                .await?;
+            let agg = response.llm_response.into_agg().await?;
+            assert_eq!(completion_text(&agg), "recovered");
+        }
+
+        // The second request starts on the key that worked.
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert_eq!(requests.len(), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn retry_exhaustion_returns_the_final_upstream_error()
     -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
         let server = MockServer::start().await;
@@ -2523,6 +2575,7 @@ mod tests {
             },
             status: None,
             retry_after: None,
+            rotated: false,
         };
         assert!(transport.is_retryable());
 
@@ -2541,6 +2594,7 @@ mod tests {
                 },
                 status: Some(status),
                 retry_after: None,
+                rotated: false,
             };
             assert!(failure.is_retryable(), "HTTP {status} should retry");
         }
@@ -2558,6 +2612,7 @@ mod tests {
                 },
                 status: Some(status),
                 retry_after: None,
+                rotated: false,
             };
             assert!(!failure.is_retryable(), "HTTP {status} should fail fast");
         }
@@ -2568,6 +2623,7 @@ mod tests {
             },
             status: None,
             retry_after: None,
+            rotated: false,
         };
         assert!(!configuration.is_retryable());
 
@@ -2578,6 +2634,7 @@ mod tests {
             },
             status: Some(StatusCode::BAD_REQUEST),
             retry_after: None,
+            rotated: false,
         };
         assert!(!context_window.is_retryable());
     }

@@ -3,6 +3,8 @@
 
 //! Per-provider backend configuration: wire format, upstream URL, and auth.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -47,9 +49,9 @@ const ANTHROPIC_OVERFLOW_PHRASES: &[&str] = &[
 pub struct HttpBackendConfig {
     /// Base URL of the provider API (e.g. `https://api.openai.com/v1`).
     pub base_url: String,
-    /// API key for the provider, loaded by the caller. `None` sends no configured auth.
+    /// API keys for the provider, loaded by the caller. Empty sends no configured auth.
     /// Client construction rejects active values that cannot form the provider's auth header.
-    pub api_key: Option<String>,
+    pub credentials: Credentials,
     /// Whether this backend forwards the caller's provider credential and application headers.
     ///
     /// All backends reachable through a forwarding route must use the same provider.
@@ -77,11 +79,70 @@ pub struct HttpBackendConfig {
     pub timeout: Option<Duration>,
 }
 
+/// API keys for one backend, used one at a time.
+///
+/// A request uses the current key. When the provider rejects it for rate limits,
+/// quota, or auth, the next key becomes current. Clones share the current key.
+#[derive(Clone, Default)]
+pub struct Credentials {
+    keys: Arc<[String]>,
+    current: Arc<AtomicUsize>,
+}
+
+impl Credentials {
+    /// Keys tried in order, wrapping back to the first after the last.
+    pub fn new(keys: Vec<String>) -> Self {
+        Self {
+            keys: keys.into(),
+            current: Arc::default(),
+        }
+    }
+
+    /// A single key.
+    pub fn api_key(key: impl Into<String>) -> Self {
+        Self::new(vec![key.into()])
+    }
+
+    /// All configured keys.
+    pub fn keys(&self) -> &[String] {
+        &self.keys
+    }
+
+    fn current(&self) -> Option<(usize, &str)> {
+        if self.keys.is_empty() {
+            return None;
+        }
+        let index = self.current.load(Ordering::Relaxed) % self.keys.len();
+        Some((index, &self.keys[index]))
+    }
+
+    // Moves past `used` only if no concurrent request already did, so two
+    // failures on the same key skip it once.
+    fn rotate_from(&self, used: usize) -> bool {
+        if self.keys.len() < 2 {
+            return false;
+        }
+        let next = (used + 1) % self.keys.len();
+        let _ = self
+            .current
+            .compare_exchange(used, next, Ordering::Relaxed, Ordering::Relaxed);
+        true
+    }
+}
+
+impl fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Credentials")
+            .field("keys", &self.keys.len())
+            .finish()
+    }
+}
+
 impl fmt::Debug for HttpBackendConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HttpBackendConfig")
             .field("base_url", &self.base_url)
-            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("credentials", &self.credentials)
             .field("forward_auth", &self.forward_auth)
             .field("extra_header_names", &self.extra_headers.keys())
             .field("extra_body_keys", &self.extra_body.keys())
@@ -150,16 +211,13 @@ impl Backend {
             });
         }
 
-        let Some(api_key) = self.configured_api_key() else {
-            return Ok(());
-        };
-        let valid_api_key = match self {
+        let valid_api_key = |api_key: &String| match self {
             Backend::OpenAiChat(_) | Backend::OpenAiResponses(_) => {
                 HeaderValue::try_from(format!("Bearer {api_key}")).is_ok()
             }
             Backend::Anthropic(_) => HeaderValue::from_str(api_key).is_ok(),
         };
-        if !valid_api_key {
+        if !self.configured_api_keys().iter().all(valid_api_key) {
             return Err(LlmClientError::Configuration {
                 message: format!(
                     "model {model_name:?} api_key cannot be encoded as an HTTP header"
@@ -188,12 +246,25 @@ impl Backend {
     }
 
     // Static credentials are unused when the caller's authorization is forwarded.
-    fn configured_api_key(&self) -> Option<&str> {
+    fn configured_api_keys(&self) -> &[String] {
         if self.is_forwarding_auth() {
-            None
+            &[]
         } else {
-            self.config().api_key.as_deref()
+            self.config().credentials.keys()
         }
+    }
+
+    /// The index of the key the next request will use, if any.
+    pub(crate) fn current_credential(&self) -> Option<usize> {
+        if self.is_forwarding_auth() {
+            return None;
+        }
+        self.config().credentials.current().map(|(index, _)| index)
+    }
+
+    /// Makes the key after `used` current. Returns whether another key exists to try.
+    pub(crate) fn rotate_credential(&self, used: usize) -> bool {
+        self.config().credentials.rotate_from(used)
     }
 
     /// The fully resolved upstream URL for this backend's endpoint.
@@ -218,8 +289,19 @@ impl Backend {
     /// OpenAI variants use `Authorization: Bearer <key>`; Anthropic uses
     /// `x-api-key: <key>` plus the required `anthropic-version` header. A backend
     /// with `forward_auth` uses the caller's provider credential instead.
-    pub fn apply_auth(&self, mut builder: RequestBuilder) -> RequestBuilder {
-        let api_key = self.configured_api_key();
+    pub fn apply_auth(&self, builder: RequestBuilder) -> RequestBuilder {
+        self.apply_auth_with(builder, self.current_credential())
+    }
+
+    // Applies the key at `credential`, read once by the caller so a failure
+    // rotates away from the key that was actually sent.
+    pub(crate) fn apply_auth_with(
+        &self,
+        mut builder: RequestBuilder,
+        credential: Option<usize>,
+    ) -> RequestBuilder {
+        let keys = self.configured_api_keys();
+        let api_key = credential.and_then(|index| keys.get(index));
         match self {
             Backend::OpenAiChat(_) | Backend::OpenAiResponses(_) => {
                 if let Some(api_key) = api_key {
@@ -424,7 +506,7 @@ mod tests {
     fn config(base_url: &str) -> HttpBackendConfig {
         HttpBackendConfig {
             base_url: base_url.to_string(),
-            api_key: Some("secret".to_string()),
+            credentials: Credentials::api_key("secret"),
             forward_auth: false,
             extra_headers: BTreeMap::new(),
             extra_body: BTreeMap::new(),
@@ -531,7 +613,7 @@ mod tests {
     fn configured_api_key_validation_matches_auth_application() {
         const INVALID_KEY: &str = "canary\nsecret";
         let mut config = config("x");
-        config.api_key = Some(INVALID_KEY.to_string());
+        config.credentials = Credentials::new(vec!["valid".to_string(), INVALID_KEY.to_string()]);
         let builders: [fn(HttpBackendConfig) -> Backend; 2] =
             [Backend::OpenAiChat, Backend::Anthropic];
         let client = reqwest::Client::new();
