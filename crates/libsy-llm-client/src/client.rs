@@ -2713,6 +2713,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn quota_and_forbidden_rotate_but_bad_requests_do_not()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        for (status, rotates) in [(402, true), (403, true), (401, true), (400, false)] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(wiremock::matchers::header("authorization", "Bearer first"))
+                .respond_with(ResponseTemplate::new(status).set_body_string("no"))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(wiremock::matchers::header("authorization", "Bearer second"))
+                .respond_with(chat_success_response())
+                .mount(&server)
+                .await;
+            let config = HttpBackendConfig {
+                credentials: Credentials::new(vec![
+                    Credential::ApiKey("first".to_string()),
+                    Credential::ApiKey("second".to_string()),
+                ]),
+                ..config_with_retries(&format!("{}/v1", server.uri()), 1)
+            };
+            let client = TranslatingLlmClient::new(&[ModelConfig::new(
+                "gpt",
+                Backend::OpenAiChat(config),
+                None,
+            )])?;
+            let result = client
+                .call_rewrite_model(request_for(Some("gpt"), false), None)
+                .await;
+            assert_eq!(result.is_ok(), rotates, "HTTP {status}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn broken_login_moves_to_the_next_credential()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::header("x-api-key", "backup"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let missing_login = crate::oauth::SubscriptionLogin::new(
+            LoginKind::ClaudeCode,
+            std::env::temp_dir().join("switchyard-client-missing-login.json"),
+        );
+        let config = HttpBackendConfig {
+            credentials: Credentials::new(vec![
+                Credential::Login(Arc::new(missing_login)),
+                Credential::ApiKey("backup".to_string()),
+            ]),
+            ..config_with_retries(&server.uri(), 1)
+        };
+        let client = TranslatingLlmClient::new(&[ModelConfig::new(
+            "claude",
+            Backend::Anthropic(config),
+            None,
+        )])?;
+        client
+            .call_rewrite_model(request_for(Some("claude"), false), None)
+            .await?
+            .llm_response
+            .into_agg()
+            .await?;
+        Ok(())
+    }
+
+    #[test]
+    fn claude_code_identity_is_prepended_once() {
+        let identity = json!({"type": "text", "text": CLAUDE_CODE_IDENTITY});
+        let cases = [
+            (json!({}), json!([identity])),
+            (
+                json!({"system": "Be brief."}),
+                json!([identity, {"type": "text", "text": "Be brief."}]),
+            ),
+            (
+                json!({"system": [{"type": "text", "text": "Be brief."}]}),
+                json!([identity, {"type": "text", "text": "Be brief."}]),
+            ),
+            (
+                json!({"system": CLAUDE_CODE_IDENTITY}),
+                json!(CLAUDE_CODE_IDENTITY),
+            ),
+            (json!({"system": [identity.clone()]}), json!([identity])),
+        ];
+        for (mut body, expected) in cases {
+            prepend_claude_code_identity(&mut body);
+            assert_eq!(body["system"], expected);
+        }
+    }
+
+    #[tokio::test]
     async fn retry_exhaustion_returns_the_final_upstream_error()
     -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
         let server = MockServer::start().await;

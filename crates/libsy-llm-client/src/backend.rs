@@ -750,6 +750,53 @@ mod tests {
     }
 
     #[test]
+    fn rotation_wraps_and_skips_a_failed_credential_once() {
+        let keys = |names: &[&str]| {
+            Credentials::new(
+                names
+                    .iter()
+                    .map(|name| Credential::ApiKey((*name).to_string()))
+                    .collect(),
+            )
+        };
+        let credentials = keys(&["a", "b", "c"]);
+        assert_eq!(credentials.current(), Some(0));
+        // Two requests that both failed on key 0 move past it only once.
+        assert!(credentials.rotate_from(0));
+        assert!(credentials.rotate_from(0));
+        assert_eq!(credentials.current(), Some(1));
+        assert!(credentials.rotate_from(1));
+        assert!(credentials.rotate_from(2));
+        assert_eq!(credentials.current(), Some(0));
+
+        let single = keys(&["only"]);
+        assert!(!single.rotate_from(0));
+        assert_eq!(single.current(), Some(0));
+        assert_eq!(Credentials::default().current(), None);
+    }
+
+    #[test]
+    fn logins_are_rejected_on_the_wrong_format() {
+        for (kind, wrong) in [
+            (
+                LoginKind::ClaudeCode,
+                Backend::OpenAiResponses as fn(HttpBackendConfig) -> Backend,
+            ),
+            (LoginKind::Codex, Backend::Anthropic),
+            (LoginKind::Codex, Backend::OpenAiChat),
+        ] {
+            let mut config = config("x");
+            config.credentials = Credentials::new(vec![Credential::Login(Arc::new(
+                SubscriptionLogin::new(kind, "/unused"),
+            ))]);
+            let error = wrong(config)
+                .validate_configured_headers("model")
+                .expect_err("login on the wrong format must fail");
+            assert!(error.to_string().contains("login only with"), "{error}");
+        }
+    }
+
+    #[test]
     fn openai_detects_canonical_and_wrapped_overflow() {
         let backend = Backend::OpenAiChat(config("x"));
         assert!(

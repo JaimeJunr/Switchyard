@@ -508,6 +508,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_requests_share_one_refresh() -> Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "new-access",
+                "refresh_token": "new-refresh",
+                "expires_in": 3600
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let path = temp_file("concurrent", &claude_file(0));
+        let login = SubscriptionLogin::with_token_url(LoginKind::ClaudeCode, &path, &server.uri());
+        let http = reqwest::Client::new();
+        let (first, second) = tokio::join!(login.access_token(&http), login.access_token(&http));
+        let _ = std::fs::remove_file(&path);
+
+        // A second refresh would spend the rotated refresh token and log the CLI out.
+        assert_eq!(first?.access_token, "new-access");
+        assert_eq!(second?.access_token, "new-access");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn token_refreshed_by_the_cli_is_reused_after_a_rejection() -> Result<()> {
+        let path = temp_file("cli-refreshed", &claude_file(now_ms() + 3_600_000));
+        let login =
+            SubscriptionLogin::with_token_url(LoginKind::ClaudeCode, &path, "http://127.0.0.1:9");
+        let http = reqwest::Client::new();
+        let first = login.access_token(&http).await?;
+        login.reject(&first.access_token).await;
+        let mut file = claude_file(now_ms() + 3_600_000);
+        file["claudeAiOauth"]["accessToken"] = json!("cli-access");
+        std::fs::write(&path, file.to_string()).expect("simulate CLI refresh");
+        let second = login.access_token(&http).await;
+        let _ = std::fs::remove_file(&path);
+
+        // The token URL is unreachable, so any refresh attempt would fail.
+        assert_eq!(second?.access_token, "cli-access");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn missing_file_and_missing_login_are_reported() {
+        let missing = std::env::temp_dir().join("switchyard-oauth-does-not-exist.json");
+        let login =
+            SubscriptionLogin::with_token_url(LoginKind::Codex, &missing, "http://127.0.0.1:9");
+        let error = login.access_token(&reqwest::Client::new()).await.err();
+        assert!(
+            error.is_some_and(|error| error.to_string().contains("cannot read credential file"))
+        );
+
+        let path = temp_file("no-login", &json!({"mcpOAuth": {}}));
+        let login =
+            SubscriptionLogin::with_token_url(LoginKind::ClaudeCode, &path, "http://127.0.0.1:9");
+        let error = login.access_token(&reqwest::Client::new()).await.err();
+        let _ = std::fs::remove_file(&path);
+        assert!(error.is_some_and(|error| error.to_string().contains("missing claudeAiOauth")));
+    }
+
+    #[tokio::test]
     async fn failed_refresh_names_the_file_but_not_the_token() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
