@@ -1206,7 +1206,7 @@ mod tests {
                 for model in ["weak", "strong"] {
                     let config = HttpBackendConfig {
                         base_url: server.uri(),
-                        api_key: None,
+                        credentials: Default::default(),
                         forward_auth: false,
                         extra_headers: BTreeMap::new(),
                         extra_body: BTreeMap::from([("store".to_string(), json!(store))]),
@@ -1352,7 +1352,7 @@ mod tests {
                 "weak",
                 Backend::Anthropic(HttpBackendConfig {
                     base_url: server.uri(),
-                    api_key: None,
+                    credentials: Default::default(),
                     forward_auth: false,
                     extra_headers: BTreeMap::new(),
                     extra_body: BTreeMap::new(),
@@ -2024,7 +2024,7 @@ mod tests {
         let backend = || {
             Backend::OpenAiChat(HttpBackendConfig {
                 base_url: format!("{}/v1", server.uri()),
-                api_key: None,
+                credentials: Default::default(),
                 forward_auth: false,
                 extra_headers: BTreeMap::new(),
                 extra_body: BTreeMap::new(),
@@ -2123,7 +2123,7 @@ mod tests {
         let backend = || {
             Backend::OpenAiChat(HttpBackendConfig {
                 base_url: format!("{}/v1", server.uri()),
-                api_key: None,
+                credentials: Default::default(),
                 forward_auth: false,
                 extra_headers: BTreeMap::new(),
                 extra_body: BTreeMap::new(),

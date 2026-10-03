@@ -745,7 +745,7 @@ fn random_state_with_retries(
 ) -> TestResult<ServerState> {
     let backend = Backend::OpenAiChat(HttpBackendConfig {
         base_url: base_url.to_string(),
-        api_key: Some("test-key".to_string()),
+        credentials: switchyard_llm_client::Credentials::api_key("test-key"),
         forward_auth: false,
         extra_headers: BTreeMap::new(),
         extra_body: BTreeMap::new(),

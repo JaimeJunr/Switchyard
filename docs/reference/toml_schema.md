@@ -51,13 +51,20 @@ route reaches no upstream. A file without a `[targets]` table is rejected with
 | `format` | Yes | — | `openai_chat`, `openai_responses`, or `anthropic_messages`. |
 | `base_url` | Yes | — | Upstream base URL. |
 | `api_key_env` | No | unset | Name of the environment variable holding the key. Omit to send no authentication. |
+| `credentials` | No | `[]` | List of keys or logins to use one at a time, such as `[{ env = "KEY_A" }, { env = "KEY_B" }]`. Cannot be combined with `api_key_env`. |
 | `forward_auth` | No | `false` | Forward the caller's provider credential and application headers. All backends reachable through the route must use the same provider. |
 | `extra_headers` | No | `{}` | Custom HTTP headers sent to the model server. Set credentials with `api_key_env` or `forward_auth`; the server rejects headers owned by the selected auth mode. Header names are case-insensitive. |
 | `max_retries` | No | `2` | Retry budget, `0`–`10`. |
 | `timeout_ms` | No | unset | Deadline in milliseconds for all attempts, retry delays, and the complete response, including stream reads. Must be at least `1`. Unset leaves the wait unbounded. |
 
 The TOML never contains the secret itself. `api_key_env` names a variable that
-must exist and be non-empty when the server loads.
+must exist and be non-empty when the server loads. The same rule applies to
+each `env` entry in `credentials`.
+
+With `credentials`, each request uses the current key. If the provider answers
+`401`, `402`, `403`, or `429`, the next key becomes current and the request is
+retried with it. This retry counts against `max_retries`. After the last key, it
+goes back to the first.
 
 `timeout_ms` applies separately to every call through the client, including judge
 verdicts and answers. To give a judge a short deadline without limiting the
@@ -71,6 +78,51 @@ continues, preserving provider events for replay. After the configured retries,
 an HTTP client failure stops routing. This also applies when `timeout_ms` is
 unset or an advisor has `fail_open = true`.
 
+A `credentials` entry can also be a Claude Code subscription login, read from
+the file Claude Code writes when you log in:
+
+```toml
+[llm_clients.claude_subscription]
+format = "anthropic_messages"
+base_url = "https://api.anthropic.com"
+credentials = [
+  { claude_code = "~/.claude/.credentials.json" },
+  { claude_code = "~/claude-account-2/.credentials.json" },
+]
+```
+
+The server reads the file on first use. When the token is about to expire, or
+the provider answers `401`, it refreshes the token and writes the new tokens
+back to the same file, so Claude Code stays logged in. The other fields in the
+file are not changed. Each request gets the Claude Code system prompt line
+first, because the provider requires it for these tokens.
+
+A Codex login with a ChatGPT account works the same way on an
+`openai_responses` client:
+
+```toml
+[llm_clients.codex_subscription]
+format = "openai_responses"
+base_url = "https://chatgpt.com/backend-api/codex"
+credentials = [
+  { codex = "~/.codex/auth.json" },
+  { codex = "~/.codex-account2/auth.json" },
+]
+```
+
+To log in a second account, run `CODEX_HOME=~/.codex-account2 codex login`. The
+server sends the account id and the `originator` header that Codex sends. It
+also sets `store = false` and `stream = true`, because this backend accepts
+nothing else. A caller that did not ask for streaming still gets one complete
+response.
+
+For a full setup with both subscriptions, many API-key providers, and a
+`switchyard/auto` route, see `examples/multi-provider/switchyard.toml`.
+
+Anthropic's terms allow subscription logins only in Claude Code and Anthropic's
+own apps. Using one here may get the account blocked. Use it only for local,
+personal setups.
+
 Set `forward_auth = true` to use each caller's credential instead of a
 server-owned key:
 
@@ -81,7 +133,7 @@ base_url = "https://api.anthropic.com"
 forward_auth = true
 ```
 
-`forward_auth` cannot be combined with `api_key_env`. OpenAI clients forward
+`forward_auth` cannot be combined with `api_key_env` or `credentials`. OpenAI clients forward
 `authorization`, `chatgpt-account-id`, and `x-openai-fedramp`. Anthropic clients
 forward `authorization` or `x-api-key`; for Claude subscription OAuth, they also
 forward `oauth-*` values from `anthropic-beta` and remove all other inbound beta

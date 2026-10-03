@@ -14,8 +14,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use switchyard_llm_client::{
-    AuxiliaryOperation, Backend, ClientRouter, DEFAULT_MAX_RETRIES, HttpBackendConfig, ModelConfig,
-    TranslatingLlmClient,
+    AuxiliaryOperation, Backend, ClientRouter, Credential, Credentials, DEFAULT_MAX_RETRIES,
+    HttpBackendConfig, LoginKind, ModelConfig, SubscriptionLogin, TranslatingLlmClient,
 };
 use switchyard_protocol::{Category, ModelId, RoutedLlmClient, WireFormat};
 
@@ -291,9 +291,7 @@ impl DeploymentConfig {
             let (Backend::OpenAiChat(config)
             | Backend::OpenAiResponses(config)
             | Backend::Anthropic(config)) = backend;
-            if let Some(key) = config.api_key {
-                provider_api_keys.push(key);
-            }
+            provider_api_keys.extend(config.credentials.api_keys().map(str::to_string));
         }
         for (target_name, target) in &self.targets {
             let client_config = self.llm_clients.get(&target.llm_client).ok_or_else(|| {
@@ -570,6 +568,9 @@ struct LlmClientConfig {
     format: ClientFormat,
     base_url: HttpBaseUrl,
     api_key_env: Option<String>,
+    /// API keys or logins tried in order; a rate limit, quota, or auth failure moves to the next one.
+    #[serde(default)]
+    credentials: Vec<CredentialConfig>,
     #[serde(default)]
     forward_auth: bool,
     #[serde(default)]
@@ -578,6 +579,17 @@ struct LlmClientConfig {
     max_retries: u32,
     /// Deadline in milliseconds for all attempts and the complete response. Unset is unbounded.
     timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+enum CredentialConfig {
+    /// Name of an environment variable holding an API key.
+    Env(String),
+    /// Path to a Claude Code credential file, such as `~/.claude/.credentials.json`.
+    ClaudeCode(String),
+    /// Path to a Codex ChatGPT credential file, such as `~/.codex/auth.json`.
+    Codex(String),
 }
 
 #[derive(Debug, Deserialize)]
@@ -664,36 +676,41 @@ fn build_backend(
             "llm client {client_name} timeout_ms must be at least 1"
         )));
     }
+    if config.api_key_env.is_some() && !config.credentials.is_empty() {
+        return Err(RunnerError::configuration(format!(
+            "llm client {client_name} cannot set both api_key_env and credentials"
+        )));
+    }
     if config.forward_auth && config.api_key_env.is_some() {
         return Err(RunnerError::configuration(format!(
             "llm client {client_name} cannot set both forward_auth and api_key_env"
         )));
     }
-    let api_key = config
-        .api_key_env
-        .as_deref()
-        .map(|variable| {
-            if variable.trim().is_empty() {
-                return Err(RunnerError::configuration(format!(
-                    "llm client {client_name} api_key_env must not be empty"
-                )));
+    if config.forward_auth && !config.credentials.is_empty() {
+        return Err(RunnerError::configuration(format!(
+            "llm client {client_name} cannot set both forward_auth and credentials"
+        )));
+    }
+    let mut credentials = Vec::new();
+    if let Some(variable) = &config.api_key_env {
+        credentials.push(Credential::ApiKey(read_api_key(client_name, variable)?));
+    }
+    for entry in &config.credentials {
+        credentials.push(match entry {
+            CredentialConfig::Env(variable) => {
+                Credential::ApiKey(read_api_key(client_name, variable)?)
             }
-            let api_key = std::env::var(variable).map_err(|error| {
-                RunnerError::configuration(format!(
-                    "llm client {client_name} could not read api_key_env {variable}: {error}"
-                ))
-            })?;
-            if api_key.trim().is_empty() {
-                return Err(RunnerError::configuration(format!(
-                    "llm client {client_name} api_key_env {variable} is empty"
-                )));
+            CredentialConfig::ClaudeCode(path) => {
+                subscription_login(client_name, config.format, LoginKind::ClaudeCode, path)?
             }
-            Ok(api_key)
-        })
-        .transpose()?;
+            CredentialConfig::Codex(path) => {
+                subscription_login(client_name, config.format, LoginKind::Codex, path)?
+            }
+        });
+    }
     let http = HttpBackendConfig {
         base_url: config.base_url.as_str().to_string(),
-        api_key,
+        credentials: Credentials::new(credentials),
         forward_auth: config.forward_auth,
         extra_headers: config.extra_headers.clone(),
         extra_body: extra_body.clone(),
@@ -708,6 +725,66 @@ fn build_backend(
         ClientFormat::AnthropicMessages => Backend::Anthropic(http),
     };
     Ok(backend)
+}
+
+fn read_api_key(client_name: &str, variable: &str) -> RunnerResult<String> {
+    if variable.trim().is_empty() {
+        return Err(RunnerError::configuration(format!(
+            "llm client {client_name} api_key_env must not be empty"
+        )));
+    }
+    let api_key = std::env::var(variable).map_err(|error| {
+        RunnerError::configuration(format!(
+            "llm client {client_name} could not read api_key_env {variable}: {error}"
+        ))
+    })?;
+    if api_key.trim().is_empty() {
+        return Err(RunnerError::configuration(format!(
+            "llm client {client_name} api_key_env {variable} is empty"
+        )));
+    }
+    Ok(api_key)
+}
+
+// The file is read on first use, so a login made after startup still works.
+fn subscription_login(
+    client_name: &str,
+    format: ClientFormat,
+    kind: LoginKind,
+    path: &str,
+) -> RunnerResult<Credential> {
+    let (name, required_format, format_name) = match kind {
+        LoginKind::ClaudeCode => (
+            "claude_code",
+            ClientFormat::AnthropicMessages,
+            "anthropic_messages",
+        ),
+        LoginKind::Codex => ("codex", ClientFormat::OpenAiResponses, "openai_responses"),
+    };
+    if format.wire_format() != required_format.wire_format() {
+        return Err(RunnerError::configuration(format!(
+            "llm client {client_name} can use {name} only with format {format_name}"
+        )));
+    }
+    if path.trim().is_empty() {
+        return Err(RunnerError::configuration(format!(
+            "llm client {client_name} {name} path must not be empty"
+        )));
+    }
+    let path = match path.strip_prefix("~/") {
+        Some(rest) => {
+            let home = std::env::var("HOME").map_err(|error| {
+                RunnerError::configuration(format!(
+                    "llm client {client_name} cannot expand ~ in {name} path: {error}"
+                ))
+            })?;
+            Path::new(&home).join(rest)
+        }
+        None => Path::new(path).to_path_buf(),
+    };
+    Ok(Credential::Login(Arc::new(SubscriptionLogin::new(
+        kind, path,
+    ))))
 }
 
 // A function so that serde default can use it.
@@ -1844,6 +1921,79 @@ confidence_threshold = 0.5
             std::env::remove_var(EMPTY_KEY_ENV);
         }
         assert!(message.contains("is empty"));
+    }
+
+    #[test]
+    fn credentials_list_loads_every_key() -> RunnerResult<()> {
+        const FIRST: &str = "SWITCHYARD_CONFIG_TEST_FIRST_KEY";
+        const SECOND: &str = "SWITCHYARD_CONFIG_TEST_SECOND_KEY";
+        unsafe {
+            // "unsafe" is for concurrent reads and writes, very rare
+            std::env::set_var(FIRST, "first-key");
+            std::env::set_var(SECOND, "second-key");
+        }
+        let configured = VALID_CONFIG.replacen(
+            "base_url = \"https://example.test/v1\"",
+            &format!(
+                "base_url = \"https://example.test/v1\"\ncredentials = [{{ env = \"{FIRST}\" }}, {{ env = \"{SECOND}\" }}]"
+            ),
+            1,
+        );
+        let runner = runner_from_toml(&configured);
+        let both = VALID_CONFIG.replacen(
+            "base_url = \"https://example.test/v1\"",
+            &format!(
+                "base_url = \"https://example.test/v1\"\napi_key_env = \"{FIRST}\"\ncredentials = [{{ env = \"{SECOND}\" }}]"
+            ),
+            1,
+        );
+        let both = error_message(&both);
+        unsafe {
+            std::env::remove_var(FIRST);
+            std::env::remove_var(SECOND);
+        }
+        assert_eq!(runner?.provider_api_keys(), ["first-key", "second-key"]);
+        assert!(both.contains("cannot set both api_key_env and credentials"));
+        Ok(())
+    }
+
+    #[test]
+    fn claude_code_login_requires_anthropic_messages() {
+        let on_anthropic = VALID_CONFIG.replacen(
+            "base_url = \"https://example.test\"",
+            "base_url = \"https://example.test\"\ncredentials = [{ claude_code = \"/tmp/credentials.json\" }]",
+            1,
+        );
+        assert!(runner_from_toml(&on_anthropic).is_ok());
+
+        let on_openai = VALID_CONFIG.replacen(
+            "base_url = \"https://example.test/v1\"",
+            "base_url = \"https://example.test/v1\"\ncredentials = [{ claude_code = \"/tmp/credentials.json\" }]",
+            1,
+        );
+        assert!(
+            error_message(&on_openai)
+                .contains("can use claude_code only with format anthropic_messages")
+        );
+    }
+
+    #[test]
+    fn codex_login_requires_openai_responses() {
+        let on_responses = VALID_CONFIG.replace(
+            "[llm_clients.responses]\nformat = \"openai_responses\"\nbase_url = \"https://example.test/v1\"",
+            "[llm_clients.responses]\nformat = \"openai_responses\"\nbase_url = \"https://example.test/v1\"\ncredentials = [{ codex = \"/tmp/auth.json\" }]",
+        );
+        assert_ne!(on_responses, VALID_CONFIG);
+        assert!(runner_from_toml(&on_responses).is_ok());
+
+        let on_chat = VALID_CONFIG.replacen(
+            "base_url = \"https://example.test/v1\"",
+            "base_url = \"https://example.test/v1\"\ncredentials = [{ codex = \"/tmp/auth.json\" }]",
+            1,
+        );
+        assert!(
+            error_message(&on_chat).contains("can use codex only with format openai_responses")
+        );
     }
 
     #[test]

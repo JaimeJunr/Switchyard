@@ -3,6 +3,8 @@
 
 //! Per-provider backend configuration: wire format, upstream URL, and auth.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -15,6 +17,9 @@ use serde_json::Value;
 use switchyard_protocol::{Metadata, WireFormat};
 
 use crate::error::{LlmClientError, Result, is_overflow_body};
+use crate::oauth::{
+    CLAUDE_CODE_OAUTH_BETA, CODEX_ORIGINATOR, LoginKind, LoginToken, SubscriptionLogin,
+};
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
@@ -47,9 +52,9 @@ const ANTHROPIC_OVERFLOW_PHRASES: &[&str] = &[
 pub struct HttpBackendConfig {
     /// Base URL of the provider API (e.g. `https://api.openai.com/v1`).
     pub base_url: String,
-    /// API key for the provider, loaded by the caller. `None` sends no configured auth.
+    /// API keys or logins for the provider, loaded by the caller. Empty sends no configured auth.
     /// Client construction rejects active values that cannot form the provider's auth header.
-    pub api_key: Option<String>,
+    pub credentials: Credentials,
     /// Whether this backend forwards the caller's provider credential and application headers.
     ///
     /// All backends reachable through a forwarding route must use the same provider.
@@ -77,11 +82,96 @@ pub struct HttpBackendConfig {
     pub timeout: Option<Duration>,
 }
 
+/// One way to authorize upstream requests.
+#[derive(Clone, Debug)]
+pub enum Credential {
+    /// A static API key.
+    ApiKey(String),
+    /// A subscription login. A Claude Code login works only on Anthropic backends,
+    /// and a Codex login only on OpenAI Responses backends.
+    Login(Arc<SubscriptionLogin>),
+}
+
+/// Credentials for one backend, used one at a time.
+///
+/// A request uses the current credential. When the provider rejects it for rate
+/// limits, quota, or auth, the next one becomes current. Clones share the current one.
+#[derive(Clone, Default)]
+pub struct Credentials {
+    entries: Arc<[Credential]>,
+    current: Arc<AtomicUsize>,
+}
+
+impl Credentials {
+    /// Credentials tried in order, wrapping back to the first after the last.
+    pub fn new(entries: Vec<Credential>) -> Self {
+        Self {
+            entries: entries.into(),
+            current: Arc::default(),
+        }
+    }
+
+    /// A single API key.
+    pub fn api_key(key: impl Into<String>) -> Self {
+        Self::new(vec![Credential::ApiKey(key.into())])
+    }
+
+    /// All configured credentials.
+    pub fn entries(&self) -> &[Credential] {
+        &self.entries
+    }
+
+    /// The static API keys among the credentials.
+    pub fn api_keys(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().filter_map(|entry| match entry {
+            Credential::ApiKey(key) => Some(key.as_str()),
+            Credential::Login(_) => None,
+        })
+    }
+
+    fn current(&self) -> Option<usize> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        Some(self.current.load(Ordering::Relaxed) % self.entries.len())
+    }
+
+    // Moves past `used` only if no concurrent request already did, so two
+    // failures on the same credential skip it once.
+    fn rotate_from(&self, used: usize) -> bool {
+        if self.entries.len() < 2 {
+            return false;
+        }
+        let next = (used + 1) % self.entries.len();
+        let _ = self
+            .current
+            .compare_exchange(used, next, Ordering::Relaxed, Ordering::Relaxed);
+        true
+    }
+}
+
+impl fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Credentials")
+            .field("count", &self.entries.len())
+            .finish()
+    }
+}
+
+/// The credential resolved for one request attempt.
+pub(crate) enum Auth {
+    ApiKey(String),
+    Login {
+        token: LoginToken,
+        login: Arc<SubscriptionLogin>,
+    },
+}
+
 impl fmt::Debug for HttpBackendConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HttpBackendConfig")
             .field("base_url", &self.base_url)
-            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("credentials", &self.credentials)
             .field("forward_auth", &self.forward_auth)
             .field("extra_header_names", &self.extra_headers.keys())
             .field("extra_body_keys", &self.extra_body.keys())
@@ -130,14 +220,14 @@ impl Backend {
         let invalid_name = self.config().extra_headers.keys().find(|name| match self {
             Backend::OpenAiChat(_) | Backend::OpenAiResponses(_) => {
                 name.eq_ignore_ascii_case("authorization")
-                    || (self.is_forwarding_auth()
+                    || ((self.is_forwarding_auth() || self.uses_login(LoginKind::Codex))
                         && (name.eq_ignore_ascii_case("chatgpt-account-id")
                             || name.eq_ignore_ascii_case("x-openai-fedramp")))
             }
             Backend::Anthropic(_) => {
                 name.eq_ignore_ascii_case("x-api-key")
                     || name.eq_ignore_ascii_case("anthropic-version")
-                    || (self.is_forwarding_auth()
+                    || ((self.is_forwarding_auth() || self.uses_login(LoginKind::ClaudeCode))
                         && (name.eq_ignore_ascii_case("authorization")
                             || name.eq_ignore_ascii_case("anthropic-beta")))
             }
@@ -150,16 +240,27 @@ impl Backend {
             });
         }
 
-        let Some(api_key) = self.configured_api_key() else {
-            return Ok(());
-        };
-        let valid_api_key = match self {
+        if self.uses_login(LoginKind::ClaudeCode) && !matches!(self, Backend::Anthropic(_)) {
+            return Err(LlmClientError::Configuration {
+                message: format!(
+                    "model {model_name:?} can use a Claude Code login only with anthropic_messages"
+                ),
+            });
+        }
+        if self.uses_login(LoginKind::Codex) && !matches!(self, Backend::OpenAiResponses(_)) {
+            return Err(LlmClientError::Configuration {
+                message: format!(
+                    "model {model_name:?} can use a Codex login only with openai_responses"
+                ),
+            });
+        }
+        let valid_api_key = |api_key: &str| match self {
             Backend::OpenAiChat(_) | Backend::OpenAiResponses(_) => {
                 HeaderValue::try_from(format!("Bearer {api_key}")).is_ok()
             }
             Backend::Anthropic(_) => HeaderValue::from_str(api_key).is_ok(),
         };
-        if !valid_api_key {
+        if !self.configured_api_keys().all(valid_api_key) {
             return Err(LlmClientError::Configuration {
                 message: format!(
                     "model {model_name:?} api_key cannot be encoded as an HTTP header"
@@ -188,12 +289,55 @@ impl Backend {
     }
 
     // Static credentials are unused when the caller's authorization is forwarded.
-    fn configured_api_key(&self) -> Option<&str> {
+    fn configured_api_keys(&self) -> impl Iterator<Item = &str> {
+        self.config()
+            .credentials
+            .api_keys()
+            .filter(|_| !self.is_forwarding_auth())
+    }
+
+    /// Whether any credential is a login of `kind`, whose requests need
+    /// provider-specific body changes.
+    pub(crate) fn uses_login(&self, kind: LoginKind) -> bool {
+        !self.is_forwarding_auth()
+            && self
+                .config()
+                .credentials
+                .entries()
+                .iter()
+                .any(|entry| matches!(entry, Credential::Login(login) if login.kind() == kind))
+    }
+
+    /// The index of the credential the next request will use, if any.
+    pub(crate) fn current_credential(&self) -> Option<usize> {
         if self.is_forwarding_auth() {
-            None
-        } else {
-            self.config().api_key.as_deref()
+            return None;
         }
+        self.config().credentials.current()
+    }
+
+    /// Makes the credential after `used` current. Returns whether another one exists to try.
+    pub(crate) fn rotate_credential(&self, used: usize) -> bool {
+        self.config().credentials.rotate_from(used)
+    }
+
+    /// Resolves the credential at `index`, refreshing a login token when needed.
+    pub(crate) async fn resolve_auth(
+        &self,
+        index: Option<usize>,
+        http: &reqwest::Client,
+    ) -> Result<Option<Auth>> {
+        let Some(entry) = index.and_then(|index| self.config().credentials.entries().get(index))
+        else {
+            return Ok(None);
+        };
+        Ok(Some(match entry {
+            Credential::ApiKey(key) => Auth::ApiKey(key.clone()),
+            Credential::Login(login) => Auth::Login {
+                token: login.access_token(http).await?,
+                login: Arc::clone(login),
+            },
+        }))
     }
 
     /// The fully resolved upstream URL for this backend's endpoint.
@@ -218,22 +362,62 @@ impl Backend {
     /// OpenAI variants use `Authorization: Bearer <key>`; Anthropic uses
     /// `x-api-key: <key>` plus the required `anthropic-version` header. A backend
     /// with `forward_auth` uses the caller's provider credential instead.
-    pub fn apply_auth(&self, mut builder: RequestBuilder) -> RequestBuilder {
-        let api_key = self.configured_api_key();
-        match self {
-            Backend::OpenAiChat(_) | Backend::OpenAiResponses(_) => {
-                if let Some(api_key) = api_key {
-                    builder = builder.bearer_auth(api_key);
+    /// A subscription login is applied only by the client, which can refresh it.
+    pub fn apply_auth(&self, builder: RequestBuilder) -> RequestBuilder {
+        let auth = self
+            .current_credential()
+            .and_then(|index| self.config().credentials.entries().get(index))
+            .and_then(|entry| match entry {
+                Credential::ApiKey(key) => Some(Auth::ApiKey(key.clone())),
+                Credential::Login(_) => None,
+            });
+        self.apply_auth_with(builder, auth.as_ref())
+    }
+
+    // Applies the credential resolved once by the caller, so a failure acts on the
+    // credential that was actually sent.
+    pub(crate) fn apply_auth_with(
+        &self,
+        mut builder: RequestBuilder,
+        auth: Option<&Auth>,
+    ) -> RequestBuilder {
+        if self.is_forwarding_auth() {
+            return self.apply_auth_with_none(builder);
+        }
+        match (self, auth) {
+            (Backend::OpenAiChat(_) | Backend::OpenAiResponses(_), Some(Auth::ApiKey(key))) => {
+                builder = builder.bearer_auth(key);
+            }
+            (Backend::OpenAiResponses(_), Some(Auth::Login { token, .. })) => {
+                builder = builder
+                    .bearer_auth(&token.access_token)
+                    .header("originator", CODEX_ORIGINATOR);
+                if let Some(account_id) = &token.account_id {
+                    builder = builder.header("chatgpt-account-id", account_id);
                 }
             }
-            Backend::Anthropic(_) => {
+            (Backend::OpenAiChat(_) | Backend::OpenAiResponses(_), _) => {}
+            (Backend::Anthropic(_), auth) => {
                 builder = builder.header("anthropic-version", ANTHROPIC_VERSION);
-                if let Some(api_key) = api_key {
-                    builder = builder.header("x-api-key", api_key);
+                match auth {
+                    Some(Auth::ApiKey(key)) => builder = builder.header("x-api-key", key),
+                    Some(Auth::Login { token, .. }) => {
+                        builder = builder
+                            .bearer_auth(&token.access_token)
+                            .header("anthropic-beta", CLAUDE_CODE_OAUTH_BETA);
+                    }
+                    None => {}
                 }
             }
         }
         builder
+    }
+
+    fn apply_auth_with_none(&self, builder: RequestBuilder) -> RequestBuilder {
+        match self {
+            Backend::Anthropic(_) => builder.header("anthropic-version", ANTHROPIC_VERSION),
+            Backend::OpenAiChat(_) | Backend::OpenAiResponses(_) => builder,
+        }
     }
 
     pub(crate) fn is_forwarding_auth(&self) -> bool {
@@ -424,7 +608,7 @@ mod tests {
     fn config(base_url: &str) -> HttpBackendConfig {
         HttpBackendConfig {
             base_url: base_url.to_string(),
-            api_key: Some("secret".to_string()),
+            credentials: Credentials::api_key("secret"),
             forward_auth: false,
             extra_headers: BTreeMap::new(),
             extra_body: BTreeMap::new(),
@@ -531,7 +715,10 @@ mod tests {
     fn configured_api_key_validation_matches_auth_application() {
         const INVALID_KEY: &str = "canary\nsecret";
         let mut config = config("x");
-        config.api_key = Some(INVALID_KEY.to_string());
+        config.credentials = Credentials::new(vec![
+            Credential::ApiKey("valid".to_string()),
+            Credential::ApiKey(INVALID_KEY.to_string()),
+        ]);
         let builders: [fn(HttpBackendConfig) -> Backend; 2] =
             [Backend::OpenAiChat, Backend::Anthropic];
         let client = reqwest::Client::new();
@@ -559,6 +746,53 @@ mod tests {
                 .expect("request");
             assert!(!request.headers().contains_key("authorization"));
             assert!(!request.headers().contains_key("x-api-key"));
+        }
+    }
+
+    #[test]
+    fn rotation_wraps_and_skips_a_failed_credential_once() {
+        let keys = |names: &[&str]| {
+            Credentials::new(
+                names
+                    .iter()
+                    .map(|name| Credential::ApiKey((*name).to_string()))
+                    .collect(),
+            )
+        };
+        let credentials = keys(&["a", "b", "c"]);
+        assert_eq!(credentials.current(), Some(0));
+        // Two requests that both failed on key 0 move past it only once.
+        assert!(credentials.rotate_from(0));
+        assert!(credentials.rotate_from(0));
+        assert_eq!(credentials.current(), Some(1));
+        assert!(credentials.rotate_from(1));
+        assert!(credentials.rotate_from(2));
+        assert_eq!(credentials.current(), Some(0));
+
+        let single = keys(&["only"]);
+        assert!(!single.rotate_from(0));
+        assert_eq!(single.current(), Some(0));
+        assert_eq!(Credentials::default().current(), None);
+    }
+
+    #[test]
+    fn logins_are_rejected_on_the_wrong_format() {
+        for (kind, wrong) in [
+            (
+                LoginKind::ClaudeCode,
+                Backend::OpenAiResponses as fn(HttpBackendConfig) -> Backend,
+            ),
+            (LoginKind::Codex, Backend::Anthropic),
+            (LoginKind::Codex, Backend::OpenAiChat),
+        ] {
+            let mut config = config("x");
+            config.credentials = Credentials::new(vec![Credential::Login(Arc::new(
+                SubscriptionLogin::new(kind, "/unused"),
+            ))]);
+            let error = wrong(config)
+                .validate_configured_headers("model")
+                .expect_err("login on the wrong format must fail");
+            assert!(error.to_string().contains("login only with"), "{error}");
         }
     }
 

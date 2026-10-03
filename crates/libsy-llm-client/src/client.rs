@@ -24,9 +24,10 @@ use switchyard_translation::{
 };
 use tracing::Instrument;
 
-use crate::backend::{Backend, openai_url};
+use crate::backend::{Auth, Backend, openai_url};
 use crate::error::{LlmClientError, Result};
 use crate::metrics;
+use crate::oauth::{CLAUDE_CODE_IDENTITY, LoginKind};
 use crate::raw::RawResponse;
 
 // Caller headers safe to send when caller auth forwarding is disabled.
@@ -265,6 +266,12 @@ impl TranslatingLlmClient {
         // After the merge on purpose: the effort override must win over both the caller's
         // value and any `reasoning` default a target set through `extra_body`.
         apply_reasoning_effort(&mut body, backend);
+        if backend.uses_login(LoginKind::ClaudeCode) {
+            prepend_claude_code_identity(&mut body);
+        }
+        if backend.uses_login(LoginKind::Codex) {
+            apply_codex_body_rules(&mut body, endpoint);
+        }
         if matches!(backend, Backend::Anthropic(_)) {
             enable_anthropic_prompt_caching(&mut body);
         }
@@ -409,7 +416,21 @@ impl TranslatingLlmClient {
         let builder = forward_metadata_headers(builder, metadata, backend);
         let builder = backend.apply_forwarded_auth(builder, metadata);
         let builder = apply_extra_headers(builder, backend);
-        let builder = backend.apply_auth(builder);
+        let credential = backend.current_credential();
+        let auth = match backend.resolve_auth(credential, &self.client).await {
+            Ok(auth) => auth,
+            Err(error) => {
+                // A broken login is tied to one credential; another one may work.
+                let rotated = credential.is_some_and(|used| backend.rotate_credential(used));
+                return Err(AttemptFailure {
+                    error,
+                    status: None,
+                    retry_after: None,
+                    rotated,
+                });
+            }
+        };
+        let builder = backend.apply_auth_with(builder, auth.as_ref());
 
         let response = match builder.send().await {
             Ok(response) => response,
@@ -419,6 +440,7 @@ impl TranslatingLlmClient {
                     error: convert_reqwest_error(error),
                     status: None,
                     retry_after: None,
+                    rotated: false,
                 });
             }
         };
@@ -434,6 +456,7 @@ impl TranslatingLlmClient {
                             error,
                             status: Some(status),
                             retry_after: None,
+                            rotated: false,
                         });
                     }
                 };
@@ -453,6 +476,7 @@ impl TranslatingLlmClient {
                         error: convert_reqwest_error(error),
                         status: Some(status),
                         retry_after: None,
+                        rotated: false,
                     });
                 }
             };
@@ -473,11 +497,22 @@ impl TranslatingLlmClient {
                     error: convert_reqwest_error(error),
                     status: Some(status),
                     retry_after,
+                    rotated: false,
                 });
             }
         };
         let body = redact_forwarded_headers(body, metadata, backend.is_forwarding_auth());
         metrics::record_upstream_attempt(Some(status.as_u16()));
+        // Rate limit, quota, and auth failures are tied to one key; another key may succeed.
+        let mut rotated = matches!(status.as_u16(), 401 | 402 | 403 | 429)
+            && credential.is_some_and(|used| backend.rotate_credential(used));
+        // A rejected login token is refreshed on the next attempt.
+        if status == reqwest::StatusCode::UNAUTHORIZED
+            && let Some(Auth::Login { token, login }) = &auth
+        {
+            login.reject(&token.access_token).await;
+            rotated = true;
+        }
         let error =
             if status == reqwest::StatusCode::BAD_REQUEST && backend.is_context_overflow(&body) {
                 LlmClientError::ContextWindowExceeded {
@@ -491,6 +526,7 @@ impl TranslatingLlmClient {
             error,
             status: Some(status),
             retry_after,
+            rotated,
         })
     }
 
@@ -536,6 +572,7 @@ impl TranslatingLlmClient {
             }
         })?;
 
+        let caller_streams = llm_request.stream;
         let http_response = self
             .send_encoded(
                 backend,
@@ -548,6 +585,15 @@ impl TranslatingLlmClient {
             .await?;
 
         let (llm_response, upstream_headers) = match http_response {
+            // A Codex login always streams; collect it for a caller that did not ask to.
+            EncodedResponse::Streaming {
+                chunks,
+                upstream_headers,
+                ..
+            } if !caller_streams => (
+                LlmResponse::Agg(LlmResponse::Stream(chunks).into_agg().await?),
+                upstream_headers,
+            ),
             EncodedResponse::Streaming {
                 chunks,
                 upstream_headers,
@@ -717,6 +763,8 @@ struct AttemptFailure {
     error: LlmClientError,
     status: Option<StatusCode>,
     retry_after: Option<Duration>,
+    // The failed key was replaced by another one, so the next attempt differs.
+    rotated: bool,
 }
 
 fn deadline_error(timeout: Duration) -> LlmClientError {
@@ -733,6 +781,9 @@ fn deadline_error(timeout: Duration) -> LlmClientError {
 
 impl AttemptFailure {
     fn is_retryable(&self) -> bool {
+        if self.rotated {
+            return true;
+        }
         match &self.error {
             LlmClientError::Transport { .. } | LlmClientError::Timeout { .. } => true,
             LlmClientError::UpstreamHttp { status, .. } => {
@@ -1137,6 +1188,54 @@ fn apply_reasoning_effort(body: &mut Value, backend: &Backend) {
 }
 
 // Applies target defaults without overriding fields supplied by the caller.
+// The ChatGPT Codex backend accepts only streamed, unstored responses and
+// requires `instructions`.
+fn apply_codex_body_rules(body: &mut Value, endpoint: UpstreamEndpoint) {
+    let Value::Object(object) = body else {
+        return;
+    };
+    object.insert("store".to_string(), Value::Bool(false));
+    object
+        .entry("instructions")
+        .or_insert_with(|| Value::String(String::new()));
+    if matches!(endpoint, UpstreamEndpoint::Completion) {
+        object.insert("stream".to_string(), Value::Bool(true));
+    }
+}
+
+// Subscription tokens are served only when the system prompt opens with the
+// Claude Code identity. The caller's own system prompt follows it.
+fn prepend_claude_code_identity(body: &mut Value) {
+    let Value::Object(object) = body else {
+        return;
+    };
+    let identity = json!({"type": "text", "text": CLAUDE_CODE_IDENTITY});
+    let system = match object.remove("system") {
+        None => vec![identity],
+        Some(Value::String(text)) if text.starts_with(CLAUDE_CODE_IDENTITY) => {
+            object.insert("system".to_string(), Value::String(text));
+            return;
+        }
+        Some(Value::String(text)) => vec![identity, json!({"type": "text", "text": text})],
+        Some(Value::Array(mut blocks)) => {
+            let starts_with_identity = blocks
+                .first()
+                .and_then(|block| block.get("text"))
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.starts_with(CLAUDE_CODE_IDENTITY));
+            if !starts_with_identity {
+                blocks.insert(0, identity);
+            }
+            blocks
+        }
+        Some(other) => {
+            object.insert("system".to_string(), other);
+            return;
+        }
+    };
+    object.insert("system".to_string(), Value::Array(system));
+}
+
 fn merge_extra_body(body: &mut Value, extra_body: &BTreeMap<String, Value>) {
     let Value::Object(object) = body else {
         return;
@@ -1295,12 +1394,12 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
-    use crate::backend::HttpBackendConfig;
+    use crate::backend::{Credential, Credentials, HttpBackendConfig};
 
     fn config(base_url: &str) -> HttpBackendConfig {
         HttpBackendConfig {
             base_url: base_url.to_string(),
-            api_key: Some("secret".to_string()),
+            credentials: Credentials::api_key("secret"),
             forward_auth: false,
             extra_headers: BTreeMap::new(),
             extra_body: BTreeMap::new(),
@@ -1381,7 +1480,7 @@ mod tests {
 
     fn forwarding_config(base_url: &str) -> HttpBackendConfig {
         HttpBackendConfig {
-            api_key: None,
+            credentials: Credentials::default(),
             forward_auth: true,
             ..config(base_url)
         }
@@ -2400,6 +2499,323 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_key_rotates_to_the_next_one()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::header("authorization", "Bearer first"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("quota exceeded"))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::header("authorization", "Bearer second"))
+            .respond_with(chat_success_response())
+            .mount(&server)
+            .await;
+
+        let config = HttpBackendConfig {
+            credentials: Credentials::new(vec![
+                Credential::ApiKey("first".to_string()),
+                Credential::ApiKey("second".to_string()),
+            ]),
+            ..config_with_retries(&format!("{}/v1", server.uri()), 1)
+        };
+        let client = TranslatingLlmClient::new(&[ModelConfig::new(
+            "gpt",
+            Backend::OpenAiChat(config),
+            None,
+        )])?;
+        for _ in 0..2 {
+            let response = client
+                .call_rewrite_model(request_for(Some("gpt"), false), None)
+                .await?;
+            let agg = response.llm_response.into_agg().await?;
+            assert_eq!(completion_text(&agg), "recovered");
+        }
+
+        // The second request starts on the key that worked.
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert_eq!(requests.len(), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn claude_code_login_refreshes_after_rejection()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "fresh-token",
+                "refresh_token": "next-refresh",
+                "expires_in": 3600
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(wiremock::matchers::header(
+                "authorization",
+                "Bearer stale-token",
+            ))
+            .respond_with(ResponseTemplate::new(401).set_body_string("token expired"))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(wiremock::matchers::header(
+                "authorization",
+                "Bearer fresh-token",
+            ))
+            .and(wiremock::matchers::header(
+                "anthropic-beta",
+                crate::oauth::CLAUDE_CODE_OAUTH_BETA,
+            ))
+            .and(|request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap_or_default();
+                body["system"][0]["text"] == CLAUDE_CODE_IDENTITY
+                    && request.headers.get("x-api-key").is_none()
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let credential_file = std::env::temp_dir().join(format!(
+            "switchyard-client-login-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &credential_file,
+            json!({"claudeAiOauth": {
+                "accessToken": "stale-token",
+                "refreshToken": "old-refresh",
+                "expiresAt": u64::MAX
+            }})
+            .to_string(),
+        )?;
+        let login = crate::oauth::SubscriptionLogin::with_token_url(
+            LoginKind::ClaudeCode,
+            &credential_file,
+            &format!("{}/oauth/token", server.uri()),
+        );
+        let config = HttpBackendConfig {
+            credentials: Credentials::new(vec![Credential::Login(Arc::new(login))]),
+            ..config_with_retries(&server.uri(), 1)
+        };
+        let client = TranslatingLlmClient::new(&[ModelConfig::new(
+            "claude",
+            Backend::Anthropic(config),
+            None,
+        )])?;
+        let response = client
+            .call_rewrite_model(request_for(Some("claude"), false), None)
+            .await;
+        let _ = std::fs::remove_file(&credential_file);
+        response?.llm_response.into_agg().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn codex_login_streams_upstream_and_collects_for_buffered_callers()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        use base64::Engine;
+        let expiry = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)?
+            .as_secs()
+            + 3_600;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(json!({"exp": expiry}).to_string());
+        let token = format!("header.{payload}.signature");
+
+        let server = MockServer::start().await;
+        let response = json!({
+            "id": "resp_1", "object": "response", "model": "gpt", "status": "completed",
+            "output": [{
+                "type": "message", "id": "msg_1", "role": "assistant", "status": "completed",
+                "content": [{"type": "output_text", "text": "ok", "annotations": []}]
+            }]
+        });
+        let event = json!({"type": "response.completed", "response": response});
+        Mock::given(method("POST"))
+            .and(path("/backend-api/codex/responses"))
+            .and(wiremock::matchers::header(
+                "authorization",
+                format!("Bearer {token}").as_str(),
+            ))
+            .and(wiremock::matchers::header(
+                "chatgpt-account-id",
+                "account-1",
+            ))
+            .and(wiremock::matchers::header(
+                "originator",
+                crate::oauth::CODEX_ORIGINATOR,
+            ))
+            .and(|request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap_or_default();
+                body["store"] == false && body["stream"] == true && body["instructions"].is_string()
+            })
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(format!("event: response.completed\ndata: {event}\n\n")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let credential_file = std::env::temp_dir().join(format!(
+            "switchyard-client-codex-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &credential_file,
+            json!({"tokens": {
+                "access_token": token,
+                "refresh_token": "refresh",
+                "account_id": "account-1"
+            }})
+            .to_string(),
+        )?;
+        let login = crate::oauth::SubscriptionLogin::with_token_url(
+            LoginKind::Codex,
+            &credential_file,
+            "http://127.0.0.1:9",
+        );
+        let config = HttpBackendConfig {
+            credentials: Credentials::new(vec![Credential::Login(Arc::new(login))]),
+            ..config(&format!("{}/backend-api/codex", server.uri()))
+        };
+        let client = TranslatingLlmClient::new(&[ModelConfig::new(
+            "gpt",
+            Backend::OpenAiResponses(config),
+            None,
+        )])?;
+        let response = client
+            .call_rewrite_model(request_for(Some("gpt"), false), None)
+            .await;
+        let _ = std::fs::remove_file(&credential_file);
+
+        let LlmResponse::Agg(agg) = response?.llm_response else {
+            panic!("a buffered caller must get a collected response");
+        };
+        assert_eq!(completion_text(&agg), "ok");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn quota_and_forbidden_rotate_but_bad_requests_do_not()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        for (status, rotates) in [(402, true), (403, true), (401, true), (400, false)] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(wiremock::matchers::header("authorization", "Bearer first"))
+                .respond_with(ResponseTemplate::new(status).set_body_string("no"))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(wiremock::matchers::header("authorization", "Bearer second"))
+                .respond_with(chat_success_response())
+                .mount(&server)
+                .await;
+            let config = HttpBackendConfig {
+                credentials: Credentials::new(vec![
+                    Credential::ApiKey("first".to_string()),
+                    Credential::ApiKey("second".to_string()),
+                ]),
+                ..config_with_retries(&format!("{}/v1", server.uri()), 1)
+            };
+            let client = TranslatingLlmClient::new(&[ModelConfig::new(
+                "gpt",
+                Backend::OpenAiChat(config),
+                None,
+            )])?;
+            let result = client
+                .call_rewrite_model(request_for(Some("gpt"), false), None)
+                .await;
+            assert_eq!(result.is_ok(), rotates, "HTTP {status}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn broken_login_moves_to_the_next_credential()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::header("x-api-key", "backup"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let missing_login = crate::oauth::SubscriptionLogin::new(
+            LoginKind::ClaudeCode,
+            std::env::temp_dir().join("switchyard-client-missing-login.json"),
+        );
+        let config = HttpBackendConfig {
+            credentials: Credentials::new(vec![
+                Credential::Login(Arc::new(missing_login)),
+                Credential::ApiKey("backup".to_string()),
+            ]),
+            ..config_with_retries(&server.uri(), 1)
+        };
+        let client = TranslatingLlmClient::new(&[ModelConfig::new(
+            "claude",
+            Backend::Anthropic(config),
+            None,
+        )])?;
+        client
+            .call_rewrite_model(request_for(Some("claude"), false), None)
+            .await?
+            .llm_response
+            .into_agg()
+            .await?;
+        Ok(())
+    }
+
+    #[test]
+    fn claude_code_identity_is_prepended_once() {
+        let identity = json!({"type": "text", "text": CLAUDE_CODE_IDENTITY});
+        let cases = [
+            (json!({}), json!([identity])),
+            (
+                json!({"system": "Be brief."}),
+                json!([identity, {"type": "text", "text": "Be brief."}]),
+            ),
+            (
+                json!({"system": [{"type": "text", "text": "Be brief."}]}),
+                json!([identity, {"type": "text", "text": "Be brief."}]),
+            ),
+            (
+                json!({"system": CLAUDE_CODE_IDENTITY}),
+                json!(CLAUDE_CODE_IDENTITY),
+            ),
+            (json!({"system": [identity.clone()]}), json!([identity])),
+        ];
+        for (mut body, expected) in cases {
+            prepend_claude_code_identity(&mut body);
+            assert_eq!(body["system"], expected);
+        }
+    }
+
+    #[tokio::test]
     async fn retry_exhaustion_returns_the_final_upstream_error()
     -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
         let server = MockServer::start().await;
@@ -2523,6 +2939,7 @@ mod tests {
             },
             status: None,
             retry_after: None,
+            rotated: false,
         };
         assert!(transport.is_retryable());
 
@@ -2541,6 +2958,7 @@ mod tests {
                 },
                 status: Some(status),
                 retry_after: None,
+                rotated: false,
             };
             assert!(failure.is_retryable(), "HTTP {status} should retry");
         }
@@ -2558,6 +2976,7 @@ mod tests {
                 },
                 status: Some(status),
                 retry_after: None,
+                rotated: false,
             };
             assert!(!failure.is_retryable(), "HTTP {status} should fail fast");
         }
@@ -2568,6 +2987,7 @@ mod tests {
             },
             status: None,
             retry_after: None,
+            rotated: false,
         };
         assert!(!configuration.is_retryable());
 
@@ -2578,6 +2998,7 @@ mod tests {
             },
             status: Some(StatusCode::BAD_REQUEST),
             retry_after: None,
+            rotated: false,
         };
         assert!(!context_window.is_retryable());
     }
