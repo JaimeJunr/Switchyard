@@ -20,14 +20,16 @@ pub mod backend;
 pub mod client;
 pub mod error;
 pub mod metrics;
+pub mod oauth;
 mod observability;
 mod observation;
 pub mod raw;
 pub mod run;
 
-pub use backend::{Backend, Credentials, DEFAULT_MAX_RETRIES, HttpBackendConfig};
+pub use backend::{Backend, Credential, Credentials, DEFAULT_MAX_RETRIES, HttpBackendConfig};
 pub use client::{AuxiliaryOperation, ModelConfig, TranslatingLlmClient};
 pub use error::{LlmClientError, Result};
+pub use oauth::ClaudeCodeLogin;
 pub use observation::{LlmCallObservation, RunObservation, RunObserver};
 pub use raw::RawResponse;
 pub use run::{ClientRouter, decide, run};

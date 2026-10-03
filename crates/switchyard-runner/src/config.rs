@@ -14,8 +14,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use switchyard_llm_client::{
-    AuxiliaryOperation, Backend, ClientRouter, Credentials, DEFAULT_MAX_RETRIES, HttpBackendConfig,
-    ModelConfig, TranslatingLlmClient,
+    AuxiliaryOperation, Backend, ClaudeCodeLogin, ClientRouter, Credential, Credentials,
+    DEFAULT_MAX_RETRIES, HttpBackendConfig, ModelConfig, TranslatingLlmClient,
 };
 use switchyard_protocol::{Category, ModelId, RoutedLlmClient, WireFormat};
 
@@ -291,7 +291,7 @@ impl DeploymentConfig {
             let (Backend::OpenAiChat(config)
             | Backend::OpenAiResponses(config)
             | Backend::Anthropic(config)) = backend;
-            provider_api_keys.extend(config.credentials.keys().iter().cloned());
+            provider_api_keys.extend(config.credentials.api_keys().map(str::to_string));
         }
         for (target_name, target) in &self.targets {
             let client_config = self.llm_clients.get(&target.llm_client).ok_or_else(|| {
@@ -568,7 +568,7 @@ struct LlmClientConfig {
     format: ClientFormat,
     base_url: HttpBaseUrl,
     api_key_env: Option<String>,
-    /// API keys tried in order; a rate limit, quota, or auth failure moves to the next one.
+    /// API keys or logins tried in order; a rate limit, quota, or auth failure moves to the next one.
     #[serde(default)]
     credentials: Vec<CredentialConfig>,
     #[serde(default)]
@@ -586,6 +586,8 @@ struct LlmClientConfig {
 enum CredentialConfig {
     /// Name of an environment variable holding an API key.
     Env(String),
+    /// Path to a Claude Code credential file, such as `~/.claude/.credentials.json`.
+    ClaudeCode(String),
 }
 
 #[derive(Debug, Deserialize)]
@@ -687,35 +689,23 @@ fn build_backend(
             "llm client {client_name} cannot set both forward_auth and credentials"
         )));
     }
-    let variables = config.api_key_env.iter().chain(
-        config
-            .credentials
-            .iter()
-            .map(|CredentialConfig::Env(variable)| variable),
-    );
-    let keys = variables
-        .map(|variable| {
-            if variable.trim().is_empty() {
-                return Err(RunnerError::configuration(format!(
-                    "llm client {client_name} api_key_env must not be empty"
-                )));
+    let mut credentials = Vec::new();
+    if let Some(variable) = &config.api_key_env {
+        credentials.push(Credential::ApiKey(read_api_key(client_name, variable)?));
+    }
+    for entry in &config.credentials {
+        credentials.push(match entry {
+            CredentialConfig::Env(variable) => {
+                Credential::ApiKey(read_api_key(client_name, variable)?)
             }
-            let api_key = std::env::var(variable).map_err(|error| {
-                RunnerError::configuration(format!(
-                    "llm client {client_name} could not read api_key_env {variable}: {error}"
-                ))
-            })?;
-            if api_key.trim().is_empty() {
-                return Err(RunnerError::configuration(format!(
-                    "llm client {client_name} api_key_env {variable} is empty"
-                )));
+            CredentialConfig::ClaudeCode(path) => {
+                claude_code_login(client_name, config.format, path)?
             }
-            Ok(api_key)
-        })
-        .collect::<RunnerResult<Vec<_>>>()?;
+        });
+    }
     let http = HttpBackendConfig {
         base_url: config.base_url.as_str().to_string(),
-        credentials: Credentials::new(keys),
+        credentials: Credentials::new(credentials),
         forward_auth: config.forward_auth,
         extra_headers: config.extra_headers.clone(),
         extra_body: extra_body.clone(),
@@ -730,6 +720,55 @@ fn build_backend(
         ClientFormat::AnthropicMessages => Backend::Anthropic(http),
     };
     Ok(backend)
+}
+
+fn read_api_key(client_name: &str, variable: &str) -> RunnerResult<String> {
+    if variable.trim().is_empty() {
+        return Err(RunnerError::configuration(format!(
+            "llm client {client_name} api_key_env must not be empty"
+        )));
+    }
+    let api_key = std::env::var(variable).map_err(|error| {
+        RunnerError::configuration(format!(
+            "llm client {client_name} could not read api_key_env {variable}: {error}"
+        ))
+    })?;
+    if api_key.trim().is_empty() {
+        return Err(RunnerError::configuration(format!(
+            "llm client {client_name} api_key_env {variable} is empty"
+        )));
+    }
+    Ok(api_key)
+}
+
+// The file is read on first use, so a login made after startup still works.
+fn claude_code_login(
+    client_name: &str,
+    format: ClientFormat,
+    path: &str,
+) -> RunnerResult<Credential> {
+    if !matches!(format, ClientFormat::AnthropicMessages) {
+        return Err(RunnerError::configuration(format!(
+            "llm client {client_name} can use claude_code only with format anthropic_messages"
+        )));
+    }
+    if path.trim().is_empty() {
+        return Err(RunnerError::configuration(format!(
+            "llm client {client_name} claude_code path must not be empty"
+        )));
+    }
+    let path = match path.strip_prefix("~/") {
+        Some(rest) => {
+            let home = std::env::var("HOME").map_err(|error| {
+                RunnerError::configuration(format!(
+                    "llm client {client_name} cannot expand ~ in claude_code path: {error}"
+                ))
+            })?;
+            Path::new(&home).join(rest)
+        }
+        None => Path::new(path).to_path_buf(),
+    };
+    Ok(Credential::ClaudeCode(Arc::new(ClaudeCodeLogin::new(path))))
 }
 
 // A function so that serde default can use it.
@@ -1900,6 +1939,26 @@ confidence_threshold = 0.5
         assert_eq!(runner?.provider_api_keys(), ["first-key", "second-key"]);
         assert!(both.contains("cannot set both api_key_env and credentials"));
         Ok(())
+    }
+
+    #[test]
+    fn claude_code_login_requires_anthropic_messages() {
+        let on_anthropic = VALID_CONFIG.replacen(
+            "base_url = \"https://example.test\"",
+            "base_url = \"https://example.test\"\ncredentials = [{ claude_code = \"/tmp/credentials.json\" }]",
+            1,
+        );
+        assert!(runner_from_toml(&on_anthropic).is_ok());
+
+        let on_openai = VALID_CONFIG.replacen(
+            "base_url = \"https://example.test/v1\"",
+            "base_url = \"https://example.test/v1\"\ncredentials = [{ claude_code = \"/tmp/credentials.json\" }]",
+            1,
+        );
+        assert!(
+            error_message(&on_openai)
+                .contains("can use claude_code only with format anthropic_messages")
+        );
     }
 
     #[test]

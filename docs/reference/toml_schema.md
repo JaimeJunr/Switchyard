@@ -51,7 +51,7 @@ route reaches no upstream. A file without a `[targets]` table is rejected with
 | `format` | Yes | — | `openai_chat`, `openai_responses`, or `anthropic_messages`. |
 | `base_url` | Yes | — | Upstream base URL. |
 | `api_key_env` | No | unset | Name of the environment variable holding the key. Omit to send no authentication. |
-| `credentials` | No | `[]` | List of keys to use one at a time, such as `[{ env = "KEY_A" }, { env = "KEY_B" }]`. Cannot be combined with `api_key_env`. |
+| `credentials` | No | `[]` | List of keys or logins to use one at a time, such as `[{ env = "KEY_A" }, { env = "KEY_B" }]`. Cannot be combined with `api_key_env`. |
 | `forward_auth` | No | `false` | Forward the caller's provider credential and application headers. All backends reachable through the route must use the same provider. |
 | `extra_headers` | No | `{}` | Custom HTTP headers sent to the model server. Set credentials with `api_key_env` or `forward_auth`; the server rejects headers owned by the selected auth mode. Header names are case-insensitive. |
 | `max_retries` | No | `2` | Retry budget, `0`–`10`. |
@@ -77,6 +77,29 @@ The Rust runner collects streams used during routing before the algorithm
 continues, preserving provider events for replay. After the configured retries,
 an HTTP client failure stops routing. This also applies when `timeout_ms` is
 unset or an advisor has `fail_open = true`.
+
+A `credentials` entry can also be a Claude Code subscription login, read from
+the file Claude Code writes when you log in:
+
+```toml
+[llm_clients.claude_subscription]
+format = "anthropic_messages"
+base_url = "https://api.anthropic.com"
+credentials = [
+  { claude_code = "~/.claude/.credentials.json" },
+  { claude_code = "~/claude-account-2/.credentials.json" },
+]
+```
+
+The server reads the file on first use. When the token is about to expire, or
+the provider answers `401`, it refreshes the token and writes the new tokens
+back to the same file, so Claude Code stays logged in. The other fields in the
+file are not changed. Each request gets the Claude Code system prompt line
+first, because the provider requires it for these tokens.
+
+Anthropic's terms allow subscription logins only in Claude Code and Anthropic's
+own apps. Using one here may get the account blocked. Use it only for local,
+personal setups.
 
 Set `forward_auth = true` to use each caller's credential instead of a
 server-owned key:

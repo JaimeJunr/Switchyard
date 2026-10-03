@@ -17,6 +17,7 @@ use serde_json::Value;
 use switchyard_protocol::{Metadata, WireFormat};
 
 use crate::error::{LlmClientError, Result, is_overflow_body};
+use crate::oauth::{CLAUDE_CODE_OAUTH_BETA, ClaudeCodeLogin};
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
@@ -49,7 +50,7 @@ const ANTHROPIC_OVERFLOW_PHRASES: &[&str] = &[
 pub struct HttpBackendConfig {
     /// Base URL of the provider API (e.g. `https://api.openai.com/v1`).
     pub base_url: String,
-    /// API keys for the provider, loaded by the caller. Empty sends no configured auth.
+    /// API keys or logins for the provider, loaded by the caller. Empty sends no configured auth.
     /// Client construction rejects active values that cannot form the provider's auth header.
     pub credentials: Credentials,
     /// Whether this backend forwards the caller's provider credential and application headers.
@@ -79,50 +80,66 @@ pub struct HttpBackendConfig {
     pub timeout: Option<Duration>,
 }
 
-/// API keys for one backend, used one at a time.
+/// One way to authorize upstream requests.
+#[derive(Clone, Debug)]
+pub enum Credential {
+    /// A static API key.
+    ApiKey(String),
+    /// A Claude Code subscription login. Only valid on Anthropic backends.
+    ClaudeCode(Arc<ClaudeCodeLogin>),
+}
+
+/// Credentials for one backend, used one at a time.
 ///
-/// A request uses the current key. When the provider rejects it for rate limits,
-/// quota, or auth, the next key becomes current. Clones share the current key.
+/// A request uses the current credential. When the provider rejects it for rate
+/// limits, quota, or auth, the next one becomes current. Clones share the current one.
 #[derive(Clone, Default)]
 pub struct Credentials {
-    keys: Arc<[String]>,
+    entries: Arc<[Credential]>,
     current: Arc<AtomicUsize>,
 }
 
 impl Credentials {
-    /// Keys tried in order, wrapping back to the first after the last.
-    pub fn new(keys: Vec<String>) -> Self {
+    /// Credentials tried in order, wrapping back to the first after the last.
+    pub fn new(entries: Vec<Credential>) -> Self {
         Self {
-            keys: keys.into(),
+            entries: entries.into(),
             current: Arc::default(),
         }
     }
 
-    /// A single key.
+    /// A single API key.
     pub fn api_key(key: impl Into<String>) -> Self {
-        Self::new(vec![key.into()])
+        Self::new(vec![Credential::ApiKey(key.into())])
     }
 
-    /// All configured keys.
-    pub fn keys(&self) -> &[String] {
-        &self.keys
+    /// All configured credentials.
+    pub fn entries(&self) -> &[Credential] {
+        &self.entries
     }
 
-    fn current(&self) -> Option<(usize, &str)> {
-        if self.keys.is_empty() {
+    /// The static API keys among the credentials.
+    pub fn api_keys(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().filter_map(|entry| match entry {
+            Credential::ApiKey(key) => Some(key.as_str()),
+            Credential::ClaudeCode(_) => None,
+        })
+    }
+
+    fn current(&self) -> Option<usize> {
+        if self.entries.is_empty() {
             return None;
         }
-        let index = self.current.load(Ordering::Relaxed) % self.keys.len();
-        Some((index, &self.keys[index]))
+        Some(self.current.load(Ordering::Relaxed) % self.entries.len())
     }
 
     // Moves past `used` only if no concurrent request already did, so two
-    // failures on the same key skip it once.
+    // failures on the same credential skip it once.
     fn rotate_from(&self, used: usize) -> bool {
-        if self.keys.len() < 2 {
+        if self.entries.len() < 2 {
             return false;
         }
-        let next = (used + 1) % self.keys.len();
+        let next = (used + 1) % self.entries.len();
         let _ = self
             .current
             .compare_exchange(used, next, Ordering::Relaxed, Ordering::Relaxed);
@@ -133,9 +150,18 @@ impl Credentials {
 impl fmt::Debug for Credentials {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Credentials")
-            .field("keys", &self.keys.len())
+            .field("count", &self.entries.len())
             .finish()
     }
+}
+
+/// The credential resolved for one request attempt.
+pub(crate) enum Auth {
+    ApiKey(String),
+    ClaudeCode {
+        token: String,
+        login: Arc<ClaudeCodeLogin>,
+    },
 }
 
 impl fmt::Debug for HttpBackendConfig {
@@ -198,7 +224,7 @@ impl Backend {
             Backend::Anthropic(_) => {
                 name.eq_ignore_ascii_case("x-api-key")
                     || name.eq_ignore_ascii_case("anthropic-version")
-                    || (self.is_forwarding_auth()
+                    || ((self.is_forwarding_auth() || self.uses_claude_code_login())
                         && (name.eq_ignore_ascii_case("authorization")
                             || name.eq_ignore_ascii_case("anthropic-beta")))
             }
@@ -211,13 +237,20 @@ impl Backend {
             });
         }
 
-        let valid_api_key = |api_key: &String| match self {
+        if self.uses_claude_code_login() && !self.is_anthropic() {
+            return Err(LlmClientError::Configuration {
+                message: format!(
+                    "model {model_name:?} can use a Claude Code login only with anthropic_messages"
+                ),
+            });
+        }
+        let valid_api_key = |api_key: &str| match self {
             Backend::OpenAiChat(_) | Backend::OpenAiResponses(_) => {
                 HeaderValue::try_from(format!("Bearer {api_key}")).is_ok()
             }
             Backend::Anthropic(_) => HeaderValue::from_str(api_key).is_ok(),
         };
-        if !self.configured_api_keys().iter().all(valid_api_key) {
+        if !self.configured_api_keys().all(valid_api_key) {
             return Err(LlmClientError::Configuration {
                 message: format!(
                     "model {model_name:?} api_key cannot be encoded as an HTTP header"
@@ -246,25 +279,55 @@ impl Backend {
     }
 
     // Static credentials are unused when the caller's authorization is forwarded.
-    fn configured_api_keys(&self) -> &[String] {
-        if self.is_forwarding_auth() {
-            &[]
-        } else {
-            self.config().credentials.keys()
-        }
+    fn configured_api_keys(&self) -> impl Iterator<Item = &str> {
+        self.config()
+            .credentials
+            .api_keys()
+            .filter(|_| !self.is_forwarding_auth())
     }
 
-    /// The index of the key the next request will use, if any.
+    /// Whether any credential is a Claude Code login, whose requests need the
+    /// Claude Code system prompt prefix.
+    pub(crate) fn uses_claude_code_login(&self) -> bool {
+        !self.is_forwarding_auth()
+            && self
+                .config()
+                .credentials
+                .entries()
+                .iter()
+                .any(|entry| matches!(entry, Credential::ClaudeCode(_)))
+    }
+
+    /// The index of the credential the next request will use, if any.
     pub(crate) fn current_credential(&self) -> Option<usize> {
         if self.is_forwarding_auth() {
             return None;
         }
-        self.config().credentials.current().map(|(index, _)| index)
+        self.config().credentials.current()
     }
 
-    /// Makes the key after `used` current. Returns whether another key exists to try.
+    /// Makes the credential after `used` current. Returns whether another one exists to try.
     pub(crate) fn rotate_credential(&self, used: usize) -> bool {
         self.config().credentials.rotate_from(used)
+    }
+
+    /// Resolves the credential at `index`, refreshing a login token when needed.
+    pub(crate) async fn resolve_auth(
+        &self,
+        index: Option<usize>,
+        http: &reqwest::Client,
+    ) -> Result<Option<Auth>> {
+        let Some(entry) = index.and_then(|index| self.config().credentials.entries().get(index))
+        else {
+            return Ok(None);
+        };
+        Ok(Some(match entry {
+            Credential::ApiKey(key) => Auth::ApiKey(key.clone()),
+            Credential::ClaudeCode(login) => Auth::ClaudeCode {
+                token: login.access_token(http).await?,
+                login: Arc::clone(login),
+            },
+        }))
     }
 
     /// The fully resolved upstream URL for this backend's endpoint.
@@ -289,33 +352,54 @@ impl Backend {
     /// OpenAI variants use `Authorization: Bearer <key>`; Anthropic uses
     /// `x-api-key: <key>` plus the required `anthropic-version` header. A backend
     /// with `forward_auth` uses the caller's provider credential instead.
+    /// A Claude Code login is applied only by the client, which can refresh it.
     pub fn apply_auth(&self, builder: RequestBuilder) -> RequestBuilder {
-        self.apply_auth_with(builder, self.current_credential())
+        let auth = self
+            .current_credential()
+            .and_then(|index| self.config().credentials.entries().get(index))
+            .and_then(|entry| match entry {
+                Credential::ApiKey(key) => Some(Auth::ApiKey(key.clone())),
+                Credential::ClaudeCode(_) => None,
+            });
+        self.apply_auth_with(builder, auth.as_ref())
     }
 
-    // Applies the key at `credential`, read once by the caller so a failure
-    // rotates away from the key that was actually sent.
+    // Applies the credential resolved once by the caller, so a failure acts on the
+    // credential that was actually sent.
     pub(crate) fn apply_auth_with(
         &self,
         mut builder: RequestBuilder,
-        credential: Option<usize>,
+        auth: Option<&Auth>,
     ) -> RequestBuilder {
-        let keys = self.configured_api_keys();
-        let api_key = credential.and_then(|index| keys.get(index));
-        match self {
-            Backend::OpenAiChat(_) | Backend::OpenAiResponses(_) => {
-                if let Some(api_key) = api_key {
-                    builder = builder.bearer_auth(api_key);
-                }
+        if self.is_forwarding_auth() {
+            return self.apply_auth_with_none(builder);
+        }
+        match (self, auth) {
+            (Backend::OpenAiChat(_) | Backend::OpenAiResponses(_), Some(Auth::ApiKey(key))) => {
+                builder = builder.bearer_auth(key);
             }
-            Backend::Anthropic(_) => {
+            (Backend::OpenAiChat(_) | Backend::OpenAiResponses(_), _) => {}
+            (Backend::Anthropic(_), auth) => {
                 builder = builder.header("anthropic-version", ANTHROPIC_VERSION);
-                if let Some(api_key) = api_key {
-                    builder = builder.header("x-api-key", api_key);
+                match auth {
+                    Some(Auth::ApiKey(key)) => builder = builder.header("x-api-key", key),
+                    Some(Auth::ClaudeCode { token, .. }) => {
+                        builder = builder
+                            .bearer_auth(token)
+                            .header("anthropic-beta", CLAUDE_CODE_OAUTH_BETA);
+                    }
+                    None => {}
                 }
             }
         }
         builder
+    }
+
+    fn apply_auth_with_none(&self, builder: RequestBuilder) -> RequestBuilder {
+        match self {
+            Backend::Anthropic(_) => builder.header("anthropic-version", ANTHROPIC_VERSION),
+            Backend::OpenAiChat(_) | Backend::OpenAiResponses(_) => builder,
+        }
     }
 
     pub(crate) fn is_forwarding_auth(&self) -> bool {
@@ -613,7 +697,10 @@ mod tests {
     fn configured_api_key_validation_matches_auth_application() {
         const INVALID_KEY: &str = "canary\nsecret";
         let mut config = config("x");
-        config.credentials = Credentials::new(vec!["valid".to_string(), INVALID_KEY.to_string()]);
+        config.credentials = Credentials::new(vec![
+            Credential::ApiKey("valid".to_string()),
+            Credential::ApiKey(INVALID_KEY.to_string()),
+        ]);
         let builders: [fn(HttpBackendConfig) -> Backend; 2] =
             [Backend::OpenAiChat, Backend::Anthropic];
         let client = reqwest::Client::new();
