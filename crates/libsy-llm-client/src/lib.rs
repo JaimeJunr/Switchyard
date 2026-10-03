@@ -29,7 +29,7 @@ pub mod run;
 pub use backend::{Backend, Credential, Credentials, DEFAULT_MAX_RETRIES, HttpBackendConfig};
 pub use client::{AuxiliaryOperation, ModelConfig, TranslatingLlmClient};
 pub use error::{LlmClientError, Result};
-pub use oauth::ClaudeCodeLogin;
+pub use oauth::{LoginKind, SubscriptionLogin};
 pub use observation::{LlmCallObservation, RunObservation, RunObserver};
 pub use raw::RawResponse;
 pub use run::{ClientRouter, decide, run};

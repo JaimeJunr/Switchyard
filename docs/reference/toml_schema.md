@@ -97,6 +97,25 @@ back to the same file, so Claude Code stays logged in. The other fields in the
 file are not changed. Each request gets the Claude Code system prompt line
 first, because the provider requires it for these tokens.
 
+A Codex login with a ChatGPT account works the same way on an
+`openai_responses` client:
+
+```toml
+[llm_clients.codex_subscription]
+format = "openai_responses"
+base_url = "https://chatgpt.com/backend-api/codex"
+credentials = [
+  { codex = "~/.codex/auth.json" },
+  { codex = "~/.codex-account2/auth.json" },
+]
+```
+
+To log in a second account, run `CODEX_HOME=~/.codex-account2 codex login`. The
+server sends the account id and the `originator` header that Codex sends. It
+also sets `store = false` and `stream = true`, because this backend accepts
+nothing else. A caller that did not ask for streaming still gets one complete
+response.
+
 Anthropic's terms allow subscription logins only in Claude Code and Anthropic's
 own apps. Using one here may get the account blocked. Use it only for local,
 personal setups.

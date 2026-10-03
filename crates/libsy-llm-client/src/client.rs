@@ -27,7 +27,7 @@ use tracing::Instrument;
 use crate::backend::{Auth, Backend, openai_url};
 use crate::error::{LlmClientError, Result};
 use crate::metrics;
-use crate::oauth::CLAUDE_CODE_IDENTITY;
+use crate::oauth::{CLAUDE_CODE_IDENTITY, LoginKind};
 use crate::raw::RawResponse;
 
 // Caller headers safe to send when caller auth forwarding is disabled.
@@ -266,8 +266,11 @@ impl TranslatingLlmClient {
         // After the merge on purpose: the effort override must win over both the caller's
         // value and any `reasoning` default a target set through `extra_body`.
         apply_reasoning_effort(&mut body, backend);
-        if backend.uses_claude_code_login() {
+        if backend.uses_login(LoginKind::ClaudeCode) {
             prepend_claude_code_identity(&mut body);
+        }
+        if backend.uses_login(LoginKind::Codex) {
+            apply_codex_body_rules(&mut body, endpoint);
         }
         if matches!(backend, Backend::Anthropic(_)) {
             enable_anthropic_prompt_caching(&mut body);
@@ -505,9 +508,9 @@ impl TranslatingLlmClient {
             && credential.is_some_and(|used| backend.rotate_credential(used));
         // A rejected login token is refreshed on the next attempt.
         if status == reqwest::StatusCode::UNAUTHORIZED
-            && let Some(Auth::ClaudeCode { token, login }) = &auth
+            && let Some(Auth::Login { token, login }) = &auth
         {
-            login.reject(token).await;
+            login.reject(&token.access_token).await;
             rotated = true;
         }
         let error =
@@ -569,6 +572,7 @@ impl TranslatingLlmClient {
             }
         })?;
 
+        let caller_streams = llm_request.stream;
         let http_response = self
             .send_encoded(
                 backend,
@@ -581,6 +585,15 @@ impl TranslatingLlmClient {
             .await?;
 
         let (llm_response, upstream_headers) = match http_response {
+            // A Codex login always streams; collect it for a caller that did not ask to.
+            EncodedResponse::Streaming {
+                chunks,
+                upstream_headers,
+                ..
+            } if !caller_streams => (
+                LlmResponse::Agg(LlmResponse::Stream(chunks).into_agg().await?),
+                upstream_headers,
+            ),
             EncodedResponse::Streaming {
                 chunks,
                 upstream_headers,
@@ -1175,6 +1188,21 @@ fn apply_reasoning_effort(body: &mut Value, backend: &Backend) {
 }
 
 // Applies target defaults without overriding fields supplied by the caller.
+// The ChatGPT Codex backend accepts only streamed, unstored responses and
+// requires `instructions`.
+fn apply_codex_body_rules(body: &mut Value, endpoint: UpstreamEndpoint) {
+    let Value::Object(object) = body else {
+        return;
+    };
+    object.insert("store".to_string(), Value::Bool(false));
+    object
+        .entry("instructions")
+        .or_insert_with(|| Value::String(String::new()));
+    if matches!(endpoint, UpstreamEndpoint::Completion) {
+        object.insert("stream".to_string(), Value::Bool(true));
+    }
+}
+
 // Subscription tokens are served only when the system prompt opens with the
 // Claude Code identity. The caller's own system prompt follows it.
 fn prepend_claude_code_identity(body: &mut Value) {
@@ -2575,12 +2603,13 @@ mod tests {
             }})
             .to_string(),
         )?;
-        let login = crate::oauth::ClaudeCodeLogin::with_token_url(
+        let login = crate::oauth::SubscriptionLogin::with_token_url(
+            LoginKind::ClaudeCode,
             &credential_file,
             &format!("{}/oauth/token", server.uri()),
         );
         let config = HttpBackendConfig {
-            credentials: Credentials::new(vec![Credential::ClaudeCode(Arc::new(login))]),
+            credentials: Credentials::new(vec![Credential::Login(Arc::new(login))]),
             ..config_with_retries(&server.uri(), 1)
         };
         let client = TranslatingLlmClient::new(&[ModelConfig::new(
@@ -2593,6 +2622,93 @@ mod tests {
             .await;
         let _ = std::fs::remove_file(&credential_file);
         response?.llm_response.into_agg().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn codex_login_streams_upstream_and_collects_for_buffered_callers()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        use base64::Engine;
+        let expiry = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)?
+            .as_secs()
+            + 3_600;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(json!({"exp": expiry}).to_string());
+        let token = format!("header.{payload}.signature");
+
+        let server = MockServer::start().await;
+        let response = json!({
+            "id": "resp_1", "object": "response", "model": "gpt", "status": "completed",
+            "output": [{
+                "type": "message", "id": "msg_1", "role": "assistant", "status": "completed",
+                "content": [{"type": "output_text", "text": "ok", "annotations": []}]
+            }]
+        });
+        let event = json!({"type": "response.completed", "response": response});
+        Mock::given(method("POST"))
+            .and(path("/backend-api/codex/responses"))
+            .and(wiremock::matchers::header(
+                "authorization",
+                format!("Bearer {token}").as_str(),
+            ))
+            .and(wiremock::matchers::header(
+                "chatgpt-account-id",
+                "account-1",
+            ))
+            .and(wiremock::matchers::header(
+                "originator",
+                crate::oauth::CODEX_ORIGINATOR,
+            ))
+            .and(|request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap_or_default();
+                body["store"] == false && body["stream"] == true && body["instructions"].is_string()
+            })
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(format!("event: response.completed\ndata: {event}\n\n")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let credential_file = std::env::temp_dir().join(format!(
+            "switchyard-client-codex-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &credential_file,
+            json!({"tokens": {
+                "access_token": token,
+                "refresh_token": "refresh",
+                "account_id": "account-1"
+            }})
+            .to_string(),
+        )?;
+        let login = crate::oauth::SubscriptionLogin::with_token_url(
+            LoginKind::Codex,
+            &credential_file,
+            "http://127.0.0.1:9",
+        );
+        let config = HttpBackendConfig {
+            credentials: Credentials::new(vec![Credential::Login(Arc::new(login))]),
+            ..config(&format!("{}/backend-api/codex", server.uri()))
+        };
+        let client = TranslatingLlmClient::new(&[ModelConfig::new(
+            "gpt",
+            Backend::OpenAiResponses(config),
+            None,
+        )])?;
+        let response = client
+            .call_rewrite_model(request_for(Some("gpt"), false), None)
+            .await;
+        let _ = std::fs::remove_file(&credential_file);
+
+        let LlmResponse::Agg(agg) = response?.llm_response else {
+            panic!("a buffered caller must get a collected response");
+        };
+        assert_eq!(completion_text(&agg), "ok");
         Ok(())
     }
 

@@ -17,7 +17,9 @@ use serde_json::Value;
 use switchyard_protocol::{Metadata, WireFormat};
 
 use crate::error::{LlmClientError, Result, is_overflow_body};
-use crate::oauth::{CLAUDE_CODE_OAUTH_BETA, ClaudeCodeLogin};
+use crate::oauth::{
+    CLAUDE_CODE_OAUTH_BETA, CODEX_ORIGINATOR, LoginKind, LoginToken, SubscriptionLogin,
+};
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
@@ -85,8 +87,9 @@ pub struct HttpBackendConfig {
 pub enum Credential {
     /// A static API key.
     ApiKey(String),
-    /// A Claude Code subscription login. Only valid on Anthropic backends.
-    ClaudeCode(Arc<ClaudeCodeLogin>),
+    /// A subscription login. A Claude Code login works only on Anthropic backends,
+    /// and a Codex login only on OpenAI Responses backends.
+    Login(Arc<SubscriptionLogin>),
 }
 
 /// Credentials for one backend, used one at a time.
@@ -122,7 +125,7 @@ impl Credentials {
     pub fn api_keys(&self) -> impl Iterator<Item = &str> {
         self.entries.iter().filter_map(|entry| match entry {
             Credential::ApiKey(key) => Some(key.as_str()),
-            Credential::ClaudeCode(_) => None,
+            Credential::Login(_) => None,
         })
     }
 
@@ -158,9 +161,9 @@ impl fmt::Debug for Credentials {
 /// The credential resolved for one request attempt.
 pub(crate) enum Auth {
     ApiKey(String),
-    ClaudeCode {
-        token: String,
-        login: Arc<ClaudeCodeLogin>,
+    Login {
+        token: LoginToken,
+        login: Arc<SubscriptionLogin>,
     },
 }
 
@@ -217,14 +220,14 @@ impl Backend {
         let invalid_name = self.config().extra_headers.keys().find(|name| match self {
             Backend::OpenAiChat(_) | Backend::OpenAiResponses(_) => {
                 name.eq_ignore_ascii_case("authorization")
-                    || (self.is_forwarding_auth()
+                    || ((self.is_forwarding_auth() || self.uses_login(LoginKind::Codex))
                         && (name.eq_ignore_ascii_case("chatgpt-account-id")
                             || name.eq_ignore_ascii_case("x-openai-fedramp")))
             }
             Backend::Anthropic(_) => {
                 name.eq_ignore_ascii_case("x-api-key")
                     || name.eq_ignore_ascii_case("anthropic-version")
-                    || ((self.is_forwarding_auth() || self.uses_claude_code_login())
+                    || ((self.is_forwarding_auth() || self.uses_login(LoginKind::ClaudeCode))
                         && (name.eq_ignore_ascii_case("authorization")
                             || name.eq_ignore_ascii_case("anthropic-beta")))
             }
@@ -237,10 +240,17 @@ impl Backend {
             });
         }
 
-        if self.uses_claude_code_login() && !self.is_anthropic() {
+        if self.uses_login(LoginKind::ClaudeCode) && !matches!(self, Backend::Anthropic(_)) {
             return Err(LlmClientError::Configuration {
                 message: format!(
                     "model {model_name:?} can use a Claude Code login only with anthropic_messages"
+                ),
+            });
+        }
+        if self.uses_login(LoginKind::Codex) && !matches!(self, Backend::OpenAiResponses(_)) {
+            return Err(LlmClientError::Configuration {
+                message: format!(
+                    "model {model_name:?} can use a Codex login only with openai_responses"
                 ),
             });
         }
@@ -286,16 +296,16 @@ impl Backend {
             .filter(|_| !self.is_forwarding_auth())
     }
 
-    /// Whether any credential is a Claude Code login, whose requests need the
-    /// Claude Code system prompt prefix.
-    pub(crate) fn uses_claude_code_login(&self) -> bool {
+    /// Whether any credential is a login of `kind`, whose requests need
+    /// provider-specific body changes.
+    pub(crate) fn uses_login(&self, kind: LoginKind) -> bool {
         !self.is_forwarding_auth()
             && self
                 .config()
                 .credentials
                 .entries()
                 .iter()
-                .any(|entry| matches!(entry, Credential::ClaudeCode(_)))
+                .any(|entry| matches!(entry, Credential::Login(login) if login.kind() == kind))
     }
 
     /// The index of the credential the next request will use, if any.
@@ -323,7 +333,7 @@ impl Backend {
         };
         Ok(Some(match entry {
             Credential::ApiKey(key) => Auth::ApiKey(key.clone()),
-            Credential::ClaudeCode(login) => Auth::ClaudeCode {
+            Credential::Login(login) => Auth::Login {
                 token: login.access_token(http).await?,
                 login: Arc::clone(login),
             },
@@ -352,14 +362,14 @@ impl Backend {
     /// OpenAI variants use `Authorization: Bearer <key>`; Anthropic uses
     /// `x-api-key: <key>` plus the required `anthropic-version` header. A backend
     /// with `forward_auth` uses the caller's provider credential instead.
-    /// A Claude Code login is applied only by the client, which can refresh it.
+    /// A subscription login is applied only by the client, which can refresh it.
     pub fn apply_auth(&self, builder: RequestBuilder) -> RequestBuilder {
         let auth = self
             .current_credential()
             .and_then(|index| self.config().credentials.entries().get(index))
             .and_then(|entry| match entry {
                 Credential::ApiKey(key) => Some(Auth::ApiKey(key.clone())),
-                Credential::ClaudeCode(_) => None,
+                Credential::Login(_) => None,
             });
         self.apply_auth_with(builder, auth.as_ref())
     }
@@ -378,14 +388,22 @@ impl Backend {
             (Backend::OpenAiChat(_) | Backend::OpenAiResponses(_), Some(Auth::ApiKey(key))) => {
                 builder = builder.bearer_auth(key);
             }
+            (Backend::OpenAiResponses(_), Some(Auth::Login { token, .. })) => {
+                builder = builder
+                    .bearer_auth(&token.access_token)
+                    .header("originator", CODEX_ORIGINATOR);
+                if let Some(account_id) = &token.account_id {
+                    builder = builder.header("chatgpt-account-id", account_id);
+                }
+            }
             (Backend::OpenAiChat(_) | Backend::OpenAiResponses(_), _) => {}
             (Backend::Anthropic(_), auth) => {
                 builder = builder.header("anthropic-version", ANTHROPIC_VERSION);
                 match auth {
                     Some(Auth::ApiKey(key)) => builder = builder.header("x-api-key", key),
-                    Some(Auth::ClaudeCode { token, .. }) => {
+                    Some(Auth::Login { token, .. }) => {
                         builder = builder
-                            .bearer_auth(token)
+                            .bearer_auth(&token.access_token)
                             .header("anthropic-beta", CLAUDE_CODE_OAUTH_BETA);
                     }
                     None => {}

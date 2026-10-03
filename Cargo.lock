@@ -2350,6 +2350,7 @@ name = "switchyard-llm-client"
 version = "0.3.0"
 dependencies = [
  "async-trait",
+ "base64",
  "futures",
  "futures-util",
  "http",

@@ -14,8 +14,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use switchyard_llm_client::{
-    AuxiliaryOperation, Backend, ClaudeCodeLogin, ClientRouter, Credential, Credentials,
-    DEFAULT_MAX_RETRIES, HttpBackendConfig, ModelConfig, TranslatingLlmClient,
+    AuxiliaryOperation, Backend, ClientRouter, Credential, Credentials, DEFAULT_MAX_RETRIES,
+    HttpBackendConfig, LoginKind, ModelConfig, SubscriptionLogin, TranslatingLlmClient,
 };
 use switchyard_protocol::{Category, ModelId, RoutedLlmClient, WireFormat};
 
@@ -588,6 +588,8 @@ enum CredentialConfig {
     Env(String),
     /// Path to a Claude Code credential file, such as `~/.claude/.credentials.json`.
     ClaudeCode(String),
+    /// Path to a Codex ChatGPT credential file, such as `~/.codex/auth.json`.
+    Codex(String),
 }
 
 #[derive(Debug, Deserialize)]
@@ -699,7 +701,10 @@ fn build_backend(
                 Credential::ApiKey(read_api_key(client_name, variable)?)
             }
             CredentialConfig::ClaudeCode(path) => {
-                claude_code_login(client_name, config.format, path)?
+                subscription_login(client_name, config.format, LoginKind::ClaudeCode, path)?
+            }
+            CredentialConfig::Codex(path) => {
+                subscription_login(client_name, config.format, LoginKind::Codex, path)?
             }
         });
     }
@@ -742,33 +747,44 @@ fn read_api_key(client_name: &str, variable: &str) -> RunnerResult<String> {
 }
 
 // The file is read on first use, so a login made after startup still works.
-fn claude_code_login(
+fn subscription_login(
     client_name: &str,
     format: ClientFormat,
+    kind: LoginKind,
     path: &str,
 ) -> RunnerResult<Credential> {
-    if !matches!(format, ClientFormat::AnthropicMessages) {
+    let (name, required_format, format_name) = match kind {
+        LoginKind::ClaudeCode => (
+            "claude_code",
+            ClientFormat::AnthropicMessages,
+            "anthropic_messages",
+        ),
+        LoginKind::Codex => ("codex", ClientFormat::OpenAiResponses, "openai_responses"),
+    };
+    if format.wire_format() != required_format.wire_format() {
         return Err(RunnerError::configuration(format!(
-            "llm client {client_name} can use claude_code only with format anthropic_messages"
+            "llm client {client_name} can use {name} only with format {format_name}"
         )));
     }
     if path.trim().is_empty() {
         return Err(RunnerError::configuration(format!(
-            "llm client {client_name} claude_code path must not be empty"
+            "llm client {client_name} {name} path must not be empty"
         )));
     }
     let path = match path.strip_prefix("~/") {
         Some(rest) => {
             let home = std::env::var("HOME").map_err(|error| {
                 RunnerError::configuration(format!(
-                    "llm client {client_name} cannot expand ~ in claude_code path: {error}"
+                    "llm client {client_name} cannot expand ~ in {name} path: {error}"
                 ))
             })?;
             Path::new(&home).join(rest)
         }
         None => Path::new(path).to_path_buf(),
     };
-    Ok(Credential::ClaudeCode(Arc::new(ClaudeCodeLogin::new(path))))
+    Ok(Credential::Login(Arc::new(SubscriptionLogin::new(
+        kind, path,
+    ))))
 }
 
 // A function so that serde default can use it.
@@ -1958,6 +1974,25 @@ confidence_threshold = 0.5
         assert!(
             error_message(&on_openai)
                 .contains("can use claude_code only with format anthropic_messages")
+        );
+    }
+
+    #[test]
+    fn codex_login_requires_openai_responses() {
+        let on_responses = VALID_CONFIG.replace(
+            "[llm_clients.responses]\nformat = \"openai_responses\"\nbase_url = \"https://example.test/v1\"",
+            "[llm_clients.responses]\nformat = \"openai_responses\"\nbase_url = \"https://example.test/v1\"\ncredentials = [{ codex = \"/tmp/auth.json\" }]",
+        );
+        assert_ne!(on_responses, VALID_CONFIG);
+        assert!(runner_from_toml(&on_responses).is_ok());
+
+        let on_chat = VALID_CONFIG.replacen(
+            "base_url = \"https://example.test/v1\"",
+            "base_url = \"https://example.test/v1\"\ncredentials = [{ codex = \"/tmp/auth.json\" }]",
+            1,
+        );
+        assert!(
+            error_message(&on_chat).contains("can use codex only with format openai_responses")
         );
     }
 
