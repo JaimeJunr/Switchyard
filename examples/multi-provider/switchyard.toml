@@ -1,0 +1,142 @@
+# Switchyard with subscription logins and many API-key providers.
+#
+# Start it with:
+#   DEEPSEEK_API_KEY=... switchyard-server --config examples/multi-provider/switchyard.toml --port 4000
+# Then send requests with model = "switchyard/auto".
+#
+# Every enabled client must have its environment variables set, or the server
+# will not start. Uncomment a provider once you have its key.
+# Model ids below are examples. Check each provider's model list.
+
+schema_version = 1
+
+# Subscription logins. The server reads and refreshes the CLI's credential file.
+# Log in first with `claude` and `codex login`.
+# Anthropic's terms allow subscription logins only in Claude Code and its own
+# apps. Using one here may get the account blocked.
+
+[llm_clients.claude_subscription]
+format = "anthropic_messages"
+base_url = "https://api.anthropic.com"
+credentials = [
+  { claude_code = "~/.claude/.credentials.json" },
+  # { claude_code = "~/claude-account2/.credentials.json" },
+]
+
+[llm_clients.codex_subscription]
+format = "openai_responses"
+base_url = "https://chatgpt.com/backend-api/codex"
+credentials = [
+  { codex = "~/.codex/auth.json" },
+  # Log in a second account with: CODEX_HOME=~/.codex-account2 codex login
+  # { codex = "~/.codex-account2/auth.json" },
+]
+
+# API-key providers. Several keys on one client are used one at a time; a
+# rate limit, quota, or auth error moves to the next key.
+
+[llm_clients.deepseek]
+format = "openai_chat"
+base_url = "https://api.deepseek.com/v1"
+credentials = [
+  { env = "DEEPSEEK_API_KEY" },
+  # { env = "DEEPSEEK_API_KEY_2" },
+]
+
+# [llm_clients.openrouter]
+# format = "openai_chat"
+# base_url = "https://openrouter.ai/api/v1"
+# credentials = [{ env = "OPENROUTER_API_KEY" }]
+
+# [llm_clients.kimi]
+# format = "openai_chat"
+# base_url = "https://api.moonshot.ai/v1"
+# credentials = [{ env = "MOONSHOT_API_KEY" }]
+
+# [llm_clients.grok]
+# format = "openai_chat"
+# base_url = "https://api.x.ai/v1"
+# credentials = [{ env = "XAI_API_KEY" }]
+
+# [llm_clients.zai]
+# format = "openai_chat"
+# base_url = "https://api.z.ai/api/paas/v4"
+# credentials = [{ env = "ZAI_API_KEY" }]
+
+# [llm_clients.deepinfra]
+# format = "openai_chat"
+# base_url = "https://api.deepinfra.com/v1/openai"
+# credentials = [{ env = "DEEPINFRA_API_KEY" }]
+
+# [llm_clients.together]
+# format = "openai_chat"
+# base_url = "https://api.together.xyz/v1"
+# credentials = [{ env = "TOGETHER_API_KEY" }]
+
+# [llm_clients.gemini]
+# format = "openai_chat"
+# base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+# credentials = [{ env = "GEMINI_API_KEY" }]
+
+# [llm_clients.openai]
+# format = "openai_responses"
+# base_url = "https://api.openai.com/v1"
+# credentials = [{ env = "OPENAI_API_KEY" }]
+
+# [llm_clients.anthropic_api]
+# format = "anthropic_messages"
+# base_url = "https://api.anthropic.com"
+# credentials = [{ env = "ANTHROPIC_API_KEY" }]
+
+# Targets: one model on one client.
+
+[targets.claude]
+id = "claude-sonnet-5-5"
+llm_client = "claude_subscription"
+
+[targets.codex]
+id = "gpt-5.6-sol"
+llm_client = "codex_subscription"
+# The ChatGPT Codex backend rejects some standard fields.
+omit_body_fields = ["max_output_tokens", "temperature", "top_p"]
+
+[targets.cheap]
+id = "deepseek-chat"
+llm_client = "deepseek"
+
+# Routes: the model name your service sends.
+
+# Cheap model for routine steps; the subscription takes over when the agent
+# stalls, loops, or hits errors.
+[routes.auto]
+id = "switchyard/auto"
+type = "stage_router"
+capable_target = "claude"
+efficient_target = "cheap"
+picker = "efficient_first"
+confidence_threshold = 0.5
+
+# Same idea with Codex as the strong model.
+[routes.auto_codex]
+id = "switchyard/auto-codex"
+type = "stage_router"
+capable_target = "codex"
+efficient_target = "cheap"
+picker = "efficient_first"
+confidence_threshold = 0.5
+
+# Fixed routes, to call one model directly.
+[routes.claude]
+id = "switchyard/claude"
+type = "passthrough"
+target = "claude"
+
+[routes.codex]
+id = "switchyard/codex"
+type = "passthrough"
+target = "codex"
+
+[routes.cheap]
+id = "switchyard/cheap"
+type = "passthrough"
+target = "cheap"

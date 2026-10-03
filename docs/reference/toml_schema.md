@@ -116,6 +116,9 @@ also sets `store = false` and `stream = true`, because this backend accepts
 nothing else. A caller that did not ask for streaming still gets one complete
 response.
 
+For a full setup with both subscriptions, many API-key providers, and a
+`switchyard/auto` route, see `examples/multi-provider/switchyard.toml`.
+
 Anthropic's terms allow subscription logins only in Claude Code and Anthropic's
 own apps. Using one here may get the account blocked. Use it only for local,
 personal setups.
